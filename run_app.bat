@@ -1,0 +1,19 @@
+@echo off
+echo Starting Film Breakdown AI...
+
+echo Checking for Virtual Environment...
+IF NOT EXIST venv (
+    echo Venv not found. Creating Virtual Environment bubble...
+    python -m venv venv
+    echo Installing required packages inside venv...
+    call .\venv\Scripts\activate.bat
+    pip install -r requirements.txt
+) ELSE (
+    echo Entering Virtual Environment...
+    call .\venv\Scripts\activate.bat
+)
+
+echo Launching App...
+python app.py
+
+pause

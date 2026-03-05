@@ -1,0 +1,27 @@
+# Environment / secrets
+.env
+
+# Virtual environment
+venv/
+.venv/
+
+# Downloaded binaries
+deno.exe
+deno.zip
+
+# Downloaded videos and outputs
+downloads/
+*.webm
+*.mp4
+*.mkv
+*.avi
+*.mov
+
+# Generated outputs
+*_keyframes/
+breakdown_*.xlsx
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
