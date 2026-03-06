@@ -34,7 +34,7 @@ class FilmBreakdownApp(ctk.CTk):
         super().__init__()
 
         self.title("🎬 Film Breakdown AI")
-        self.geometry("620x720")
+        self.geometry("620x800")
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(5, weight=1)  # status box expands
@@ -54,10 +54,20 @@ class FilmBreakdownApp(ctk.CTk):
         ctk.CTkButton(self.api_frame, text="Save to .env", width=100, command=self.save_api_key).grid(
             row=0, column=2, padx=10, pady=10)
 
+        ctk.CTkLabel(self.api_frame, text="Gemini API Key:", font=("Arial", 14, "bold")).grid(
+            row=1, column=0, padx=10, pady=(0, 10), sticky="w")
+        self.gemini_entry = ctk.CTkEntry(self.api_frame, show="*", placeholder_text="Enter Gemini API Key...")
+        self.gemini_entry.grid(row=1, column=1, padx=10, pady=(0, 10), sticky="ew")
+        ctk.CTkButton(self.api_frame, text="Save to .env", width=100, command=self.save_gemini_key).grid(
+            row=1, column=2, padx=10, pady=(0, 10))
+
         load_dotenv()
         existing_key = os.environ.get("MOONSHOT_API_KEY", os.environ.get("KIMI_API_KEY", ""))
         if existing_key:
             self.api_entry.insert(0, existing_key)
+        existing_gemini_key = os.environ.get("GEMINI_API_KEY", "")
+        if existing_gemini_key:
+            self.gemini_entry.insert(0, existing_gemini_key)
 
         # ── Row 1: Video Selection ────────────────────────────────────────────
         self.video_frame = ctk.CTkFrame(self)
@@ -110,7 +120,13 @@ class FilmBreakdownApp(ctk.CTk):
             self.options_frame,
             text="Has dialogue / voiceover  (uses existing subtitles, or WhisperX if none found)")
         self.dialogue_check.grid(
-            row=3, column=0, columnspan=3, padx=10, pady=(0, 12), sticky="w")
+            row=3, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="w")
+
+        self.gemini_check = ctk.CTkCheckBox(
+            self.options_frame,
+            text="Use Gemini Video AI  (uploads full video; sees motion & character continuity)")
+        self.gemini_check.grid(
+            row=4, column=0, columnspan=3, padx=10, pady=(0, 12), sticky="w")
 
         # ── Row 3: Run + Cancel ───────────────────────────────────────────────
         self.controls_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -163,6 +179,16 @@ class FilmBreakdownApp(ctk.CTk):
         os.environ["KIMI_API_KEY"] = key
         messagebox.showinfo("Success", "API Key successfully saved to .env file!")
 
+    def save_gemini_key(self):
+        key = self.gemini_entry.get().strip()
+        if not key:
+            messagebox.showwarning("Warning", "Gemini API Key field is empty.")
+            return
+        env_path = os.path.join(os.getcwd(), ".env")
+        set_key(env_path, "GEMINI_API_KEY", key)
+        os.environ["GEMINI_API_KEY"] = key
+        messagebox.showinfo("Success", "Gemini API Key successfully saved to .env file!")
+
     # ── Video selection ───────────────────────────────────────────────────────
 
     def select_video(self):
@@ -204,6 +230,7 @@ class FilmBreakdownApp(ctk.CTk):
         self._threshold_value  = PACE_THRESHOLD[int(self.threshold_slider.get())]
         self._use_local_model  = bool(self.local_model_check.get())
         self._transcribe_audio = bool(self.dialogue_check.get())
+        self._use_gemini       = bool(self.gemini_check.get())
 
         self.select_btn.configure(state="disabled")
         self.run_btn.configure(state="disabled", text="⏳ Analyzing...")
@@ -351,6 +378,7 @@ class FilmBreakdownApp(ctk.CTk):
                 progress_callback=self._on_progress,
                 use_local_model=self._use_local_model,
                 transcribe_audio=self._transcribe_audio,
+                use_gemini=self._use_gemini,
             )
 
             if self.cancel_event.is_set():
