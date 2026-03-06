@@ -1,5 +1,7 @@
 # Environment / secrets
 .env
+cookies.txt
+*.log
 
 # Virtual environment
 venv/
