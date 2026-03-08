@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import openai
 from scenedetect import open_video, SceneManager
-from scenedetect.detectors import ContentDetector, ThresholdDetector, AdaptiveDetector
+from scenedetect.detectors import ContentDetector
 from dotenv import load_dotenv
 import time
 import re
@@ -246,7 +246,7 @@ def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 2
     """
     warnings = []
     video_path_obj = Path(video_path)
-    output_dir   = video_path_obj.parent / f"{video_path_obj.stem}_keyframes"
+    output_dir   = video_path_obj.parent / "screencaps"
     sidecar_path = video_path_obj.parent / f"breakdown_{video_path_obj.stem}_progress.json"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -260,13 +260,14 @@ def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 2
         except Exception as e:
             print(f"Could not load resume file, starting fresh: {e}")
 
-    # ── Detect scenes (hard cuts + fades + dissolves) ─────────────────────────
+    # ── Detect scenes ─────────────────────────────────────────────────────────
+    # Single detector with min_scene_len prevents duplicate/micro-scenes that
+    # arise when multiple detectors fire at slightly different frame offsets
+    # for the same cut.
     print(f"Detecting scenes (pace threshold={threshold:.0f})...")
     video_stream = open_video(video_path)
     scene_mgr    = SceneManager()
-    scene_mgr.add_detector(ContentDetector(threshold=threshold))          # hard cuts
-    scene_mgr.add_detector(ThresholdDetector(threshold=8, fade_bias=0))   # fades to/from black or white
-    scene_mgr.add_detector(AdaptiveDetector(adaptive_threshold=3.0))      # dissolves / crossfades
+    scene_mgr.add_detector(ContentDetector(threshold=threshold, min_scene_len=15))
     scene_mgr.detect_scenes(video_stream, show_progress=False)
     scene_list = scene_mgr.get_scene_list()
     print(f"Detected {len(scene_list)} scenes.")

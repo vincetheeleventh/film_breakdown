@@ -70,7 +70,12 @@ class FilmBreakdownApp(ctk.CTk):
 
         self.select_btn = ctk.CTkButton(
             self.video_frame, text="📁 Browse Local Video", command=self.select_video, width=150)
-        self.select_btn.grid(row=0, column=2, padx=10, pady=(15, 0))
+        self.select_btn.grid(row=0, column=2, padx=(10, 4), pady=(15, 0))
+
+        self.open_downloads_btn = ctk.CTkButton(
+            self.video_frame, text="📂 Downloads", command=self.open_downloads,
+            width=110, fg_color="#444444", hover_color="#555555")
+        self.open_downloads_btn.grid(row=0, column=3, padx=(0, 10), pady=(15, 0))
 
         ctk.CTkLabel(self.video_frame, text="Or YouTube URL:").grid(
             row=1, column=0, padx=10, pady=15, sticky="w")
@@ -185,6 +190,18 @@ class FilmBreakdownApp(ctk.CTk):
         else:
             self.run_btn.configure(state="disabled")
 
+    def open_downloads(self):
+        downloads_dir = os.path.join(os.getcwd(), 'downloads')
+        os.makedirs(downloads_dir, exist_ok=True)
+        if os.name == 'nt':
+            os.startfile(downloads_dir)
+        elif sys.platform == 'darwin':
+            import subprocess
+            subprocess.Popen(['open', downloads_dir])
+        else:
+            import subprocess
+            subprocess.Popen(['xdg-open', downloads_dir])
+
     # ── Options ───────────────────────────────────────────────────────────────
 
     def on_threshold_change(self, value):
@@ -261,7 +278,7 @@ class FilmBreakdownApp(ctk.CTk):
 
                 ydl_opts = {
                     'format':          'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                    'outtmpl':         '%(title)s [%(id)s].%(ext)s',
+                    'outtmpl':         '%(title)s [%(id)s]/%(title)s [%(id)s].%(ext)s',
                     'paths':           {'home': os.path.join(os.getcwd(), 'downloads')},
                     'noplaylist':      True,
                     'quiet':           False,
