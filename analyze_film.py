@@ -27,6 +27,7 @@ MOONSHOT_MODEL = os.environ.get("MOONSHOT_MODEL", "moonshot-v1-8k-vision-preview
 LOCAL_MODEL    = os.environ.get("LOCAL_MODEL",    "llava")
 LOCAL_BASE_URL = os.environ.get("LOCAL_BASE_URL", "http://localhost:11434/v1")
 MAX_WORKERS    = int(os.environ.get("ANALYSIS_WORKERS", "4"))
+GEMINI_MODEL   = os.environ.get("GEMINI_MODEL",   "gemini-2.0-flash")
 
 def get_shot_schema():
     return {
@@ -237,9 +238,155 @@ def run_whisperx_transcription(video_path: str) -> list:
         print(f"Whisper transcription failed: {e}")
         return []
 
+def _fmt_time(sec: float) -> str:
+    h, rem = divmod(int(sec), 3600)
+    m, s   = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def analyze_with_gemini(video_path: str, shot_meta: list,
+                        cancel_event=None, progress_callback=None) -> Dict[int, dict]:
+    """
+    Uploads the full video to Gemini File API, then asks Gemini to describe
+    every shot (using PySceneDetect-detected boundaries) in a single request.
+    Returns dict mapping 0-based shot index → analysis result dict.
+    """
+    try:
+        from google import genai
+        from google.genai import types as genai_types
+    except ImportError:
+        print("google-genai not installed. Run: pip install google-genai")
+        return {}
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("GEMINI_API_KEY not set — add it to your .env file.")
+        return {}
+
+    client = genai.Client(api_key=api_key)
+
+    # ── Upload video ──────────────────────────────────────────────────────────
+    ext = Path(video_path).suffix.lower()
+    mime_map = {'.mp4': 'video/mp4', '.webm': 'video/webm', '.mkv': 'video/x-matroska',
+                '.avi': 'video/x-msvideo', '.mov': 'video/quicktime'}
+    mime_type = mime_map.get(ext, 'video/mp4')
+
+    print("Uploading video to Gemini File API (this may take a moment)...")
+    try:
+        upload_resp = client.files.upload(
+            file=video_path,
+            config=genai_types.UploadFileConfig(mime_type=mime_type)
+        )
+        file_name = upload_resp.name
+    except Exception as e:
+        print(f"Gemini upload failed: {e}")
+        return {}
+
+    # ── Poll until processing complete ────────────────────────────────────────
+    print("Waiting for Gemini to process video...")
+    try:
+        while True:
+            if cancel_event and cancel_event.is_set():
+                try: client.files.delete(name=file_name)
+                except Exception: pass
+                return {}
+            file_info = client.files.get(name=file_name)
+            state = file_info.state.name if hasattr(file_info.state, 'name') else str(file_info.state)
+            if state == "ACTIVE":
+                break
+            if state == "FAILED":
+                raise RuntimeError("Gemini video processing failed.")
+            print("  Still processing...")
+            time.sleep(8)
+    except Exception as e:
+        print(f"Gemini processing error: {e}")
+        try: client.files.delete(name=file_name)
+        except Exception: pass
+        return {}
+
+    # ── Build shot list for the prompt ───────────────────────────────────────
+    shot_list_str = "\n".join(
+        f"Shot {m['index']+1}: {_fmt_time(m['start_sec'])} → {_fmt_time(m['end_sec'])} ({m['duration_sec']:.1f}s)"
+        for m in shot_meta
+    )
+
+    prompt = (
+        "You are a professional filmmaker creating a shot-by-shot breakdown.\n\n"
+        "The following shots have been detected in this video:\n"
+        f"{shot_list_str}\n\n"
+        "For each shot, watch what actually happens between those timestamps — "
+        "observe character ACTIONS (not just poses), the shot type "
+        "(close-up, medium, wide, two-shot, over-the-shoulder, POV, insert, etc.), "
+        "and the camera movement (static, pan left/right, tilt up/down, zoom in/out, "
+        "dolly in/out, handheld, crane/jib). "
+        "Give recurring characters consistent descriptive names (e.g. 'Man in Grey Suit') "
+        "so they can be tracked across the whole film.\n\n"
+        "Output ONLY a valid JSON array — no markdown, no extra text:\n"
+        "[\n"
+        '  {"shot_number": 1, "shot_type": "...", "whats_depicted": "...", '
+        '"camera_movement": "...", "characters_in_shot": [{"name": "...", "description": "..."}]},\n'
+        "  ...\n"
+        "]"
+    )
+
+    # ── Generate ──────────────────────────────────────────────────────────────
+    print(f"Sending {len(shot_meta)}-shot analysis request to Gemini...")
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                genai_types.Part.from_uri(file_uri=file_info.uri, mime_type=mime_type),
+                prompt,
+            ],
+            config=genai_types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=8192,
+            ),
+        )
+    except Exception as e:
+        print(f"Gemini generation failed: {e}")
+        try: client.files.delete(name=file_name)
+        except Exception: pass
+        return {}
+    finally:
+        # Always delete uploaded file
+        try: client.files.delete(name=file_name)
+        except Exception: pass
+
+    # ── Parse JSON response ───────────────────────────────────────────────────
+    raw = response.text.strip()
+    raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+    raw = re.sub(r'```\s*$', '', raw, flags=re.MULTILINE).strip()
+
+    try:
+        shots_json = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"Gemini returned invalid JSON: {e}")
+        print(f"Raw response (first 500 chars): {raw[:500]}")
+        return {}
+
+    results: Dict[int, dict] = {}
+    for item in shots_json:
+        shot_num = item.get("shot_number", 0)
+        idx = shot_num - 1
+        if 0 <= idx < len(shot_meta):
+            results[idx] = {
+                "shot_type":          item.get("shot_type", ""),
+                "whats_depicted":     item.get("whats_depicted", ""),
+                "camera_movement":    item.get("camera_movement", ""),
+                "characters_in_shot": item.get("characters_in_shot", []),
+            }
+
+    print(f"Gemini returned analysis for {len(results)}/{len(shot_meta)} shots.")
+    if progress_callback:
+        progress_callback(len(shot_meta), len(shot_meta))
+    return results
+
+
 def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 27.0,
                   cancel_event=None, progress_callback=None, use_local_model: bool = False,
-                  transcribe_audio: bool = False) -> Optional[list]:
+                  transcribe_audio: bool = False, use_gemini: bool = False,
+                  flash_suppression: bool = False) -> Optional[list]:
     """
     Returns a list of warning strings on success (empty = no warnings).
     Returns None if cancelled.
@@ -264,10 +411,16 @@ def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 2
     # Single detector with min_scene_len prevents duplicate/micro-scenes that
     # arise when multiple detectors fire at slightly different frame offsets
     # for the same cut.
-    print(f"Detecting scenes (pace threshold={threshold:.0f})...")
+    # Flash suppression raises min_scene_len to ~1.5s (45 frames at 30fps),
+    # filtering out false cuts caused by strobe/flash effects.
+    min_scene_len = 45 if flash_suppression else 4
+    if flash_suppression:
+        print(f"Detecting scenes (pace threshold={threshold:.0f}, flash suppression ON)...")
+    else:
+        print(f"Detecting scenes (pace threshold={threshold:.0f})...")
     video_stream = open_video(video_path)
     scene_mgr    = SceneManager()
-    scene_mgr.add_detector(ContentDetector(threshold=threshold, min_scene_len=15))
+    scene_mgr.add_detector(ContentDetector(threshold=threshold, min_scene_len=min_scene_len))
     scene_mgr.detect_scenes(video_stream, show_progress=False)
     scene_list = scene_mgr.get_scene_list()
     print(f"Detected {len(scene_list)} scenes.")
@@ -392,98 +545,124 @@ def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 2
                     if t['start'] < meta["end_sec"] and (t['start'] + t['duration']) > meta["start_sec"]
                 )
 
-    # ── Phase 2: Parallel LLM analysis ───────────────────────────────────────
-    prompt_schema_str = json.dumps(get_shot_schema(), indent=2)
-
-    def analyze_one(meta) -> tuple:
-        idx = meta["index"]
-        if cancel_event and cancel_event.is_set():
-            return idx, None
-        if not meta["keyframe_path"]:
-            return idx, None
-
-        if mock_test:
-            print(f"Mocking shot {idx+1}...")
-            time.sleep(0.05)
-            return idx, {
-                "shot_type": "Close up",
-                "whats_depicted": "Character A looks at the camera",
-                "camera_movement": "Static",
-                "characters_in_shot": [{"name": "Character A", "description": "Brown hair, blue shirt"}]
-            }
-
-        b64 = encode_image(meta["keyframe_path"])
-        prompt_text = (
-            "You are a professional filmmaker breaking down a scene. "
-            "Analyze this single frame. Identify the shot type, what is depicted "
-            "(including any action), and infer the camera movement. Give any prominent "
-            "characters logical descriptive names (e.g., 'Woman in Red').\n\n"
-            f"Output strictly valid JSON matching this schema:\n{prompt_schema_str}"
-        )
-
-        for attempt in range(3):
-            try:
-                resp = client.chat.completions.create(
-                    model=model_name,
-                    timeout=60,
-                    messages=[{"role": "user", "content": [
-                        {"type": "text", "text": prompt_text},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                    ]}],
-                    response_format={"type": "json_object"},
-                    temperature=0.2
-                )
-                return idx, json.loads(resp.choices[0].message.content)
-            except Exception as e:
-                print(f"Shot {idx+1} error (attempt {attempt+1}/3): {e}")
-                if attempt < 2:
-                    time.sleep(2)
-        return idx, None
-
+    # ── Phase 2: LLM analysis (Gemini full-video or Moonshot per-frame) ─────────
     results: Dict[int, Optional[dict]] = dict(completed_results)
-    to_analyze   = [m for m in shot_meta if m["index"] not in results and m["keyframe_path"]]
-    already_done = len(results)
-    resume_note  = f" ({already_done} resumed)" if already_done else ""
-    print(f"Analyzing {len(to_analyze)} shots with {MAX_WORKERS} parallel workers{resume_note}...")
 
-    if progress_callback and already_done:
-        progress_callback(already_done, total_scenes)
-
-    completed_in_run = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(analyze_one, m): m["index"] for m in to_analyze}
-
-        for future in as_completed(futures):
-            if cancel_event and cancel_event.is_set():
-                for f in futures:
-                    f.cancel()
-                break
-
+    if use_gemini and not mock_test:
+        shots_needing_analysis = [m for m in shot_meta if m["index"] not in results]
+        if shots_needing_analysis:
+            print(f"Using Gemini Video API for {len(shots_needing_analysis)} shots...")
+            gemini_results = analyze_with_gemini(
+                video_path, shots_needing_analysis, cancel_event, progress_callback)
+            results.update(gemini_results)
             try:
-                idx, result = future.result()
-                results[idx] = result
-                completed_in_run += 1
-                print(f"Analyzed shot {idx+1}/{total_scenes}")
+                sidecar_path.write_text(json.dumps({
+                    "video_path": video_path,
+                    "shots": {str(k): v for k, v in results.items() if v is not None}
+                }), encoding='utf-8')
+            except Exception as e:
+                print(f"Warning: Could not save progress: {e}")
+        else:
+            print("All shots already analysed (resumed from sidecar).")
+            if progress_callback:
+                progress_callback(total_scenes, total_scenes)
+
+        if cancel_event and cancel_event.is_set():
+            print("\nAnalysis cancelled.")
+            return None
+
+    else:
+        # ── Moonshot / Ollama per-frame analysis ─────────────────────────────
+        prompt_schema_str = json.dumps(get_shot_schema(), indent=2)
+
+        def analyze_one(meta) -> tuple:
+            idx = meta["index"]
+            if cancel_event and cancel_event.is_set():
+                return idx, None
+            if not meta["keyframe_path"]:
+                return idx, None
+
+            if mock_test:
+                print(f"Mocking shot {idx+1}...")
+                time.sleep(0.05)
+                return idx, {
+                    "shot_type": "Close up",
+                    "whats_depicted": "Character A looks at the camera",
+                    "camera_movement": "Static",
+                    "characters_in_shot": [{"name": "Character A", "description": "Brown hair, blue shirt"}]
+                }
+
+            b64 = encode_image(meta["keyframe_path"])
+            prompt_text = (
+                "You are a professional filmmaker breaking down a scene. "
+                "Analyze this single frame. Identify the shot type, what is depicted "
+                "(including any action), and infer the camera movement. Give any prominent "
+                "characters logical descriptive names (e.g., 'Woman in Red').\n\n"
+                f"Output strictly valid JSON matching this schema:\n{prompt_schema_str}"
+            )
+
+            for attempt in range(3):
+                try:
+                    resp = client.chat.completions.create(
+                        model=model_name,
+                        timeout=60,
+                        messages=[{"role": "user", "content": [
+                            {"type": "text", "text": prompt_text},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                        ]}],
+                        response_format={"type": "json_object"},
+                        temperature=0.2
+                    )
+                    return idx, json.loads(resp.choices[0].message.content)
+                except Exception as e:
+                    print(f"Shot {idx+1} error (attempt {attempt+1}/3): {e}")
+                    if attempt < 2:
+                        time.sleep(2)
+            return idx, None
+
+        to_analyze   = [m for m in shot_meta if m["index"] not in results and m["keyframe_path"]]
+        already_done = len(results)
+        resume_note  = f" ({already_done} resumed)" if already_done else ""
+        print(f"Analyzing {len(to_analyze)} shots with {MAX_WORKERS} parallel workers{resume_note}...")
+
+        if progress_callback and already_done:
+            progress_callback(already_done, total_scenes)
+
+        completed_in_run = 0
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(analyze_one, m): m["index"] for m in to_analyze}
+
+            for future in as_completed(futures):
+                if cancel_event and cancel_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                    break
 
                 try:
-                    sidecar_path.write_text(json.dumps({
-                        "video_path": video_path,
-                        "shots": {str(k): v for k, v in results.items() if v is not None}
-                    }), encoding='utf-8')
+                    idx, result = future.result()
+                    results[idx] = result
+                    completed_in_run += 1
+                    print(f"Analyzed shot {idx+1}/{total_scenes}")
+
+                    try:
+                        sidecar_path.write_text(json.dumps({
+                            "video_path": video_path,
+                            "shots": {str(k): v for k, v in results.items() if v is not None}
+                        }), encoding='utf-8')
+                    except Exception as e:
+                        print(f"Warning: Could not save progress: {e}")
+
+                    if progress_callback:
+                        progress_callback(already_done + completed_in_run, total_scenes)
                 except Exception as e:
-                    print(f"Warning: Could not save progress: {e}")
+                    print(f"Shot processing error: {e}")
+                    completed_in_run += 1
+                    if progress_callback:
+                        progress_callback(already_done + completed_in_run, total_scenes)
 
-                if progress_callback:
-                    progress_callback(already_done + completed_in_run, total_scenes)
-            except Exception as e:
-                print(f"Shot processing error: {e}")
-                completed_in_run += 1
-                if progress_callback:
-                    progress_callback(already_done + completed_in_run, total_scenes)
-
-    if cancel_event and cancel_event.is_set():
-        print(f"\nAnalysis cancelled. Progress saved — re-run to resume from where you left off.")
-        return None
+        if cancel_event and cancel_event.is_set():
+            print(f"\nAnalysis cancelled. Progress saved — re-run to resume from where you left off.")
+            return None
 
     # ── Phase 3: Assemble shot_data in order ──────────────────────────────────
     shot_data = []
