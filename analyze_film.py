@@ -370,12 +370,17 @@ def analyze_with_gemini(video_path: str, shot_meta: list,
         print(f"Raw response (first 500 chars): {raw[:500]}")
         return {}
 
+    # Map shot_number (as labelled in prompt, using global m['index']+1) back to global index.
+    # This correctly handles resume runs where shot_meta is a subset and shot numbers are
+    # NOT contiguous from 1 — e.g. shot numbers 51–100 when only the second half needs analysis.
+    shot_num_to_idx = {m['index'] + 1: m['index'] for m in shot_meta}
+
     results: Dict[int, dict] = {}
     for item in shots_json:
         shot_num = item.get("shot_number", 0)
-        idx = shot_num - 1
-        if 0 <= idx < len(shot_meta):
-            results[idx] = {
+        global_idx = shot_num_to_idx.get(shot_num)
+        if global_idx is not None:
+            results[global_idx] = {
                 "shot_type":                item.get("shot_type", ""),
                 "whats_depicted":           item.get("whats_depicted", ""),
                 "camera_movement":          item.get("camera_movement", ""),
