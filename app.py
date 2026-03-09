@@ -242,6 +242,42 @@ class FilmBreakdownApp(ctk.CTk):
 
     # ── Analysis control ──────────────────────────────────────────────────────
 
+    def _show_success_dialog(self, xlsx_path):
+        """Show completion dialog with an Open Spreadsheet button. Called on main thread."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Film Breakdown Complete")
+        dialog.geometry("420x160")
+        dialog.resizable(False, False)
+        dialog.lift()
+        dialog.focus()
+
+        ctk.CTkLabel(
+            dialog, text="Film Breakdown completed!",
+            font=("Arial", 15, "bold")
+        ).pack(pady=(22, 4))
+        ctk.CTkLabel(
+            dialog, text=str(xlsx_path),
+            font=("Arial", 10), text_color="gray", wraplength=380
+        ).pack(pady=(0, 16))
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack()
+
+        def open_xlsx():
+            try:
+                os.startfile(str(xlsx_path))
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open file:\n{e}")
+            dialog.destroy()
+
+        ctk.CTkButton(
+            btn_frame, text="📊 Open Spreadsheet", command=open_xlsx,
+            fg_color="green", hover_color="darkgreen", width=160
+        ).pack(side="left", padx=8)
+        ctk.CTkButton(
+            btn_frame, text="Close", command=dialog.destroy, width=80
+        ).pack(side="left", padx=8)
+
     def cancel_analysis(self):
         self.cancel_event.set()
         self.cancel_btn.configure(state="disabled", text="Cancelling...")
@@ -417,9 +453,9 @@ class FilmBreakdownApp(ctk.CTk):
                 if result_warnings:
                     for w in result_warnings:
                         messagebox.showwarning("Warning", w)
-                messagebox.showinfo(
-                    "Success",
-                    "Film Breakdown completed!\nCheck the video folder for the generated .xlsx file.")
+                from pathlib import Path as _Path
+                xlsx_path = _Path(target_path).parent / f"breakdown_{_Path(target_path).stem}.xlsx"
+                self.after(0, lambda p=xlsx_path: self._show_success_dialog(p))
 
         except Exception as e:
             print(f"\n❌ Error during execution: {e}")

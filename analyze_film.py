@@ -343,8 +343,8 @@ def analyze_with_gemini(video_path: str, shot_meta: list,
         "]"
     )
 
-    # Dynamic token budget: ~500 tokens per shot (richer descriptions), clamped to model limits
-    max_output_tokens = min(65536, max(8192, len(shot_meta) * 500))
+    # Dynamic token budget: ~750 tokens per shot (rich descriptions + commentary), clamped to model limits
+    max_output_tokens = min(65536, max(8192, len(shot_meta) * 750))
     print(f"Sending {len(shot_meta)}-shot analysis request to Gemini (max_tokens={max_output_tokens})...")
     try:
         response = client.models.generate_content(
@@ -638,7 +638,11 @@ def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 2
             r = results.get(meta["index"])
             if r and r.get("representative_timestamp") is not None:
                 ts = float(r["representative_timestamp"])
-                ts = max(meta["start_sec"], min(ts, meta["end_sec"] - 0.05))
+                # Clamp with an inset buffer on both ends to skip fade-in/fade-out
+                # frames that sit right at scene boundaries. Use min(0.5s, 10% of
+                # shot duration) so very short shots still get a valid frame.
+                inset = min(0.5, meta["duration_sec"] * 0.1)
+                ts = max(meta["start_sec"] + inset, min(ts, meta["end_sec"] - inset))
             else:
                 ts = (meta["start_sec"] + meta["end_sec"]) / 2
             cap_kf.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps_kf))
