@@ -5,21 +5,27 @@ import glob
 import customtkinter as ctk
 import yt_dlp
 from tkinter import filedialog, messagebox
-from dotenv import set_key, load_dotenv
+from dotenv import load_dotenv
 
 from analyze_film import analyze_video
 
-ctk.set_appearance_mode("Dark")
-ctk.set_default_color_theme("blue")
+# ── Palette ───────────────────────────────────────────────────────────────────
+PARCHMENT  = "#F5F0E8"   # warm cream — app background
+CARD_BG    = "#FDFBF7"   # off-white — card fill
+NEAR_BLACK = "#1A1614"   # almost-black — borders & primary text
+CRIMSON    = "#8B1A1A"   # deep red — accent, run button
+WARM_MID   = "#B8AFA6"   # muted — slider track, disabled
+WARM_GRAY  = "#7A6E67"   # subdued — labels, captions
 
-# Maps the 1-5 user-facing pace level to ContentDetector threshold values.
-# Lower threshold = more sensitive = detects more cuts.
+ctk.set_appearance_mode("Light")
+ctk.set_default_color_theme("blue")   # individual colors overridden below
+
 PACE_THRESHOLD = {
-    1: 40,  # Documentary / slow art film
-    2: 32,  # Drama / interview
-    3: 27,  # Standard (default)
-    4: 18,  # Fast-paced / commercial
-    5: 10,  # Action / music video
+    1: 40,   # Documentary
+    2: 32,   # Drama
+    3: 27,   # Standard
+    4: 18,   # Fast-paced
+    5: 10,   # Action
 }
 PACE_LABEL = {
     1: "Documentary",
@@ -29,191 +35,255 @@ PACE_LABEL = {
     5: "Action",
 }
 
+
+def _card(parent, **kw):
+    """Neobrutalist card: square corners, 2 px black border."""
+    return ctk.CTkFrame(
+        parent,
+        fg_color=CARD_BG,
+        corner_radius=0,
+        border_width=2,
+        border_color=NEAR_BLACK,
+        **kw,
+    )
+
+
 class FilmBreakdownApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("🎬 Film Breakdown AI")
-        self.geometry("620x800")
+        self.title("Film Breakdown")
+        self.geometry("600x720")
+        self.configure(fg_color=PARCHMENT)
+        self.resizable(False, True)
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(5, weight=1)  # status box expands
+        self.grid_rowconfigure(6, weight=1)   # log row expands
 
         self.cancel_event = threading.Event()
         self.video_path   = None
 
-        # ── Row 0: API Key ────────────────────────────────────────────────────
-        self.api_frame = ctk.CTkFrame(self)
-        self.api_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
-        self.api_frame.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(self.api_frame, text="Moonshot API Key:", font=("Arial", 14, "bold")).grid(
-            row=0, column=0, padx=10, pady=10, sticky="w")
-        self.api_entry = ctk.CTkEntry(self.api_frame, show="*", placeholder_text="Enter API Key...")
-        self.api_entry.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
-        ctk.CTkButton(self.api_frame, text="Save to .env", width=100, command=self.save_api_key).grid(
-            row=0, column=2, padx=10, pady=10)
-
-        ctk.CTkLabel(self.api_frame, text="Gemini API Key:", font=("Arial", 14, "bold")).grid(
-            row=1, column=0, padx=10, pady=(0, 10), sticky="w")
-        self.gemini_entry = ctk.CTkEntry(self.api_frame, show="*", placeholder_text="Enter Gemini API Key...")
-        self.gemini_entry.grid(row=1, column=1, padx=10, pady=(0, 10), sticky="ew")
-        ctk.CTkButton(self.api_frame, text="Save to .env", width=100, command=self.save_gemini_key).grid(
-            row=1, column=2, padx=10, pady=(0, 10))
-
         load_dotenv()
-        existing_key = os.environ.get("MOONSHOT_API_KEY", os.environ.get("KIMI_API_KEY", ""))
-        if existing_key:
-            self.api_entry.insert(0, existing_key)
-        existing_gemini_key = os.environ.get("GEMINI_API_KEY", "")
-        if existing_gemini_key:
-            self.gemini_entry.insert(0, existing_gemini_key)
 
-        # ── Row 1: Video Selection ────────────────────────────────────────────
-        self.video_frame = ctk.CTkFrame(self)
-        self.video_frame.grid(row=1, column=0, padx=20, pady=(0, 10), sticky="ew")
-        self.video_frame.grid_columnconfigure(1, weight=1)
-
-        self.file_label = ctk.CTkLabel(
-            self.video_frame, text="No Video Selected", font=("Arial", 14, "italic"), text_color="gray")
-        self.file_label.grid(row=0, column=0, columnspan=2, padx=10, pady=(15, 0), sticky="ew")
-
-        self.select_btn = ctk.CTkButton(
-            self.video_frame, text="📁 Browse Local Video", command=self.select_video, width=150)
-        self.select_btn.grid(row=0, column=2, padx=(10, 4), pady=(15, 0))
-
-        self.open_downloads_btn = ctk.CTkButton(
-            self.video_frame, text="📂 Downloads", command=self.open_downloads,
-            width=110, fg_color="#444444", hover_color="#555555")
-        self.open_downloads_btn.grid(row=0, column=3, padx=(0, 10), pady=(15, 0))
-
-        ctk.CTkLabel(self.video_frame, text="Or YouTube URL:").grid(
-            row=1, column=0, padx=10, pady=15, sticky="w")
-        self.yt_entry = ctk.CTkEntry(
-            self.video_frame, placeholder_text="https://www.youtube.com/watch?v=...")
-        self.yt_entry.grid(row=1, column=1, columnspan=2, padx=10, pady=15, sticky="ew")
-        self.yt_entry.bind("<KeyRelease>", self.check_fields)
-
-        # ── Row 2: Options ────────────────────────────────────────────────────
-        self.options_frame = ctk.CTkFrame(self)
-        self.options_frame.grid(row=2, column=0, padx=20, pady=(0, 10), sticky="ew")
-        self.options_frame.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(self.options_frame, text="Cutting Pace:").grid(
-            row=0, column=0, padx=10, pady=(12, 2), sticky="w")
-        self.threshold_slider = ctk.CTkSlider(
-            self.options_frame, from_=1, to=5, number_of_steps=4,
-            command=self.on_threshold_change)
-        self.threshold_slider.set(3)
-        self.threshold_slider.grid(row=0, column=1, padx=10, pady=(12, 2), sticky="ew")
-        self.threshold_val_label = ctk.CTkLabel(
-            self.options_frame, text="Standard", width=95, anchor="w")
-        self.threshold_val_label.grid(row=0, column=2, padx=(0, 10), pady=(12, 2))
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(self, fg_color="transparent")
+        hdr.grid(row=0, column=0, padx=24, pady=(24, 0), sticky="ew")
+        hdr.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
-            self.options_frame,
-            text="1 = Documentary (15s+ shots)  ·  2 = Drama (6–15s)  ·  3 = Standard (3–6s)  ·  4 = Fast-paced (1–3s)  ·  5 = Action / music video (<1s)",
-            font=("Arial", 11), text_color="gray", wraplength=560, justify="left"
-        ).grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 8), sticky="w")
+            hdr, text="FILM BREAKDOWN",
+            font=ctk.CTkFont(family="Georgia", size=26, weight="bold"),
+            text_color=NEAR_BLACK, anchor="w",
+        ).grid(row=0, column=0, sticky="w")
 
-        self.local_model_check = ctk.CTkCheckBox(
-            self.options_frame, text="Use local Ollama model (no API key needed)")
-        self.local_model_check.grid(
-            row=2, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="w")
+        ctk.CTkLabel(
+            hdr, text="AI-POWERED SHOT ANALYSIS",
+            font=ctk.CTkFont(family="Georgia", size=10),
+            text_color=WARM_GRAY, anchor="w",
+        ).grid(row=1, column=0, pady=(1, 0), sticky="w")
 
-        self.dialogue_check = ctk.CTkCheckBox(
-            self.options_frame,
-            text="Has dialogue / voiceover  (uses existing subtitles, or WhisperX if none found)")
-        self.dialogue_check.grid(
-            row=3, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="w")
+        # rule
+        ctk.CTkFrame(
+            self, fg_color=NEAR_BLACK, height=3, corner_radius=0,
+        ).grid(row=1, column=0, padx=24, pady=(10, 18), sticky="ew")
 
-        self.gemini_check = ctk.CTkCheckBox(
-            self.options_frame,
-            text="Use Gemini Video AI  (uploads full video; sees motion & character continuity)")
-        self.gemini_check.grid(
-            row=4, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="w")
+        # ── Video source card ─────────────────────────────────────────────────
+        vsrc = _card(self)
+        vsrc.grid(row=2, column=0, padx=24, pady=(0, 10), sticky="ew")
+        vsrc.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            vsrc, text="VIDEO SOURCE",
+            font=ctk.CTkFont(family="Georgia", size=9, weight="bold"),
+            text_color=WARM_GRAY,
+        ).grid(row=0, column=0, columnspan=4, padx=14, pady=(10, 0), sticky="w")
+
+        self.file_label = ctk.CTkLabel(
+            vsrc, text="No file selected",
+            font=ctk.CTkFont(size=12),
+            text_color=WARM_MID, anchor="w",
+        )
+        self.file_label.grid(row=1, column=0, columnspan=2,
+                              padx=14, pady=(4, 8), sticky="ew")
+
+        self.select_btn = ctk.CTkButton(
+            vsrc, text="Browse File",
+            corner_radius=0, border_width=2, border_color=NEAR_BLACK,
+            fg_color=CARD_BG, hover_color="#EDE8DF",
+            text_color=NEAR_BLACK,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            width=118, height=32,
+            command=self.select_video,
+        )
+        self.select_btn.grid(row=1, column=2, padx=(4, 4), pady=(4, 8))
+
+        ctk.CTkButton(
+            vsrc, text="Downloads",
+            corner_radius=0, border_width=2, border_color=NEAR_BLACK,
+            fg_color=CARD_BG, hover_color="#EDE8DF",
+            text_color=NEAR_BLACK,
+            font=ctk.CTkFont(size=12),
+            width=92, height=32,
+            command=self.open_downloads,
+        ).grid(row=1, column=3, padx=(0, 14), pady=(4, 8))
+
+        ctk.CTkFrame(vsrc, fg_color=NEAR_BLACK, height=1, corner_radius=0).grid(
+            row=2, column=0, columnspan=4, sticky="ew", padx=14)
+
+        ctk.CTkLabel(
+            vsrc, text="YouTube URL",
+            font=ctk.CTkFont(family="Georgia", size=10),
+            text_color=WARM_GRAY,
+        ).grid(row=3, column=0, padx=14, pady=(8, 10), sticky="w")
+
+        self.yt_entry = ctk.CTkEntry(
+            vsrc,
+            placeholder_text="https://www.youtube.com/watch?v=...",
+            corner_radius=0, border_width=2, border_color=NEAR_BLACK,
+            fg_color=CARD_BG, text_color=NEAR_BLACK,
+            font=ctk.CTkFont(size=12),
+            height=34,
+        )
+        self.yt_entry.grid(row=3, column=1, columnspan=3,
+                            padx=(0, 14), pady=(8, 10), sticky="ew")
+        self.yt_entry.bind("<KeyRelease>", self.check_fields)
+
+        # ── Options card ──────────────────────────────────────────────────────
+        opts = _card(self)
+        opts.grid(row=3, column=0, padx=24, pady=(0, 10), sticky="ew")
+        opts.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            opts, text="CUTTING PACE",
+            font=ctk.CTkFont(family="Georgia", size=9, weight="bold"),
+            text_color=WARM_GRAY,
+        ).grid(row=0, column=0, columnspan=4, padx=14, pady=(10, 2), sticky="w")
+
+        ctk.CTkLabel(
+            opts, text="Slower",
+            font=ctk.CTkFont(size=10), text_color=WARM_GRAY,
+        ).grid(row=1, column=0, padx=(14, 2), pady=4, sticky="w")
+
+        self.threshold_slider = ctk.CTkSlider(
+            opts, from_=1, to=5, number_of_steps=4,
+            button_color=CRIMSON, button_hover_color="#6B1414",
+            progress_color=CRIMSON, fg_color=WARM_MID,
+            command=self.on_threshold_change,
+        )
+        self.threshold_slider.set(4)   # default: Fast-paced
+        self.threshold_slider.grid(row=1, column=1, padx=4, pady=4, sticky="ew")
+
+        ctk.CTkLabel(
+            opts, text="Faster",
+            font=ctk.CTkFont(size=10), text_color=WARM_GRAY,
+        ).grid(row=1, column=2, padx=(2, 8), pady=4)
+
+        self.threshold_val_label = ctk.CTkLabel(
+            opts, text="Fast-paced",
+            font=ctk.CTkFont(family="Georgia", size=11, weight="bold"),
+            text_color=CRIMSON,
+        )
+        self.threshold_val_label.grid(row=1, column=3, padx=(0, 14), pady=4)
+
+        ctk.CTkFrame(opts, fg_color=NEAR_BLACK, height=1, corner_radius=0).grid(
+            row=2, column=0, columnspan=4, sticky="ew", padx=14, pady=(4, 0))
+
+        chk_row = ctk.CTkFrame(opts, fg_color="transparent")
+        chk_row.grid(row=3, column=0, columnspan=4, padx=14, pady=(8, 12), sticky="w")
+
+        _chk_kw = dict(
+            font=ctk.CTkFont(size=12), text_color=NEAR_BLACK,
+            fg_color=CRIMSON, hover_color="#6B1414",
+            checkmark_color=CARD_BG,
+            border_color=NEAR_BLACK, corner_radius=0,
+        )
+
+        self.gemini_check = ctk.CTkCheckBox(chk_row, text="Gemini Video AI", **_chk_kw)
+        self.gemini_check.pack(side="left", padx=(0, 22))
         self.gemini_check.select()
 
-        self.flash_check = ctk.CTkCheckBox(
-            self.options_frame,
-            text="Flash suppression  (ignores scenes < 1.5s — use for strobe / flashing content)")
-        self.flash_check.grid(
-            row=5, column=0, columnspan=3, padx=10, pady=(0, 12), sticky="w")
+        self.dialogue_check = ctk.CTkCheckBox(chk_row, text="Dialogue / Subtitles", **_chk_kw)
+        self.dialogue_check.pack(side="left")
 
-        # ── Row 3: Run + Cancel ───────────────────────────────────────────────
-        self.controls_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.controls_frame.grid(row=3, column=0, padx=20, pady=(0, 5), sticky="ew")
-        self.controls_frame.grid_columnconfigure(0, weight=1)
+        # ── Run + Cancel ──────────────────────────────────────────────────────
+        run_row = ctk.CTkFrame(self, fg_color="transparent")
+        run_row.grid(row=4, column=0, padx=24, pady=(0, 10), sticky="ew")
+        run_row.grid_columnconfigure(0, weight=1)
 
         self.run_btn = ctk.CTkButton(
-            self.controls_frame, text="▶ Start Breakdown Analysis",
-            font=("Arial", 16, "bold"), height=50, state="disabled",
-            fg_color="green", hover_color="darkgreen",
-            command=self.start_analysis_thread)
-        self.run_btn.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+            run_row,
+            text="▶  START BREAKDOWN",
+            font=ctk.CTkFont(family="Georgia", size=15, weight="bold"),
+            height=52, state="disabled",
+            corner_radius=0, border_width=2, border_color=NEAR_BLACK,
+            fg_color=CRIMSON, hover_color="#6B1414",
+            text_color=PARCHMENT,
+            command=self.start_analysis_thread,
+        )
+        self.run_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
         self.cancel_btn = ctk.CTkButton(
-            self.controls_frame, text="✕ Cancel", width=90, height=50,
-            state="disabled", fg_color="#555555", hover_color="#777777",
-            command=self.cancel_analysis)
+            run_row,
+            text="✕",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            width=52, height=52, state="disabled",
+            corner_radius=0, border_width=2, border_color=NEAR_BLACK,
+            fg_color=CARD_BG, hover_color="#EDE8DF",
+            text_color=NEAR_BLACK,
+            command=self.cancel_analysis,
+        )
         self.cancel_btn.grid(row=0, column=1)
 
-        # ── Row 4: Progress bar ───────────────────────────────────────────────
-        self.progress_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.progress_frame.grid(row=4, column=0, padx=20, pady=(5, 5), sticky="ew")
-        self.progress_frame.grid_columnconfigure(0, weight=1)
+        # ── Progress ──────────────────────────────────────────────────────────
+        prog_row = ctk.CTkFrame(self, fg_color="transparent")
+        prog_row.grid(row=5, column=0, padx=24, pady=(0, 8), sticky="ew")
+        prog_row.grid_columnconfigure(0, weight=1)
 
-        self.progress_bar = ctk.CTkProgressBar(self.progress_frame)
+        self.progress_bar = ctk.CTkProgressBar(
+            prog_row,
+            corner_radius=0, border_width=0, height=6,
+            progress_color=CRIMSON, fg_color=WARM_MID,
+        )
         self.progress_bar.set(0)
         self.progress_bar.grid(row=0, column=0, sticky="ew", padx=(0, 10))
 
         self.progress_label = ctk.CTkLabel(
-            self.progress_frame, text="Shot 0 / 0", width=90, anchor="e")
+            prog_row, text="Shot 0 / 0",
+            font=ctk.CTkFont(family="Georgia", size=10),
+            text_color=WARM_GRAY, width=90, anchor="e",
+        )
         self.progress_label.grid(row=0, column=1)
 
-        # ── Row 5: Status log ─────────────────────────────────────────────────
-        self.status_box = ctk.CTkTextbox(self, state="disabled", height=150)
-        self.status_box.grid(row=5, column=0, padx=20, pady=(0, 20), sticky="nsew")
+        # ── Status log ────────────────────────────────────────────────────────
+        self.status_box = ctk.CTkTextbox(
+            self, state="disabled", height=160,
+            corner_radius=0, border_width=2, border_color=NEAR_BLACK,
+            fg_color=NEAR_BLACK, text_color="#C4B6AC",
+            font=ctk.CTkFont(family="Courier New", size=11),
+            scrollbar_button_color=WARM_GRAY,
+            scrollbar_button_hover_color=WARM_MID,
+        )
+        self.status_box.grid(row=6, column=0, padx=24, pady=(0, 24), sticky="nsew")
 
-        # Thread-safe stdout redirect
         self.original_stdout = sys.stdout
         sys.stdout = OutputRedirector(self.status_box, self)
-
-    # ── API key ───────────────────────────────────────────────────────────────
-
-    def save_api_key(self):
-        key = self.api_entry.get().strip()
-        if not key:
-            messagebox.showwarning("Warning", "API Key field is empty.")
-            return
-        env_path = os.path.join(os.getcwd(), ".env")
-        set_key(env_path, "KIMI_API_KEY", key)
-        os.environ["KIMI_API_KEY"] = key
-        messagebox.showinfo("Success", "API Key successfully saved to .env file!")
-
-    def save_gemini_key(self):
-        key = self.gemini_entry.get().strip()
-        if not key:
-            messagebox.showwarning("Warning", "Gemini API Key field is empty.")
-            return
-        env_path = os.path.join(os.getcwd(), ".env")
-        set_key(env_path, "GEMINI_API_KEY", key)
-        os.environ["GEMINI_API_KEY"] = key
-        messagebox.showinfo("Success", "Gemini API Key successfully saved to .env file!")
 
     # ── Video selection ───────────────────────────────────────────────────────
 
     def select_video(self):
         filetypes = (
             ("Video files", "*.mp4 *.webm *.mkv *.avi *.mov"),
-            ("All files", "*.*")
+            ("All files", "*.*"),
         )
         filepath = filedialog.askopenfilename(
             title="Select a Video", initialdir=os.getcwd(), filetypes=filetypes)
         if filepath:
             self.video_path = filepath
             self.file_label.configure(
-                text=os.path.basename(filepath), text_color="white", font=("Arial", 14, "bold"))
+                text=os.path.basename(filepath),
+                text_color=NEAR_BLACK,
+                font=ctk.CTkFont(size=12, weight="bold"),
+            )
             self.yt_entry.delete(0, "end")
             self.check_fields()
 
@@ -224,16 +294,16 @@ class FilmBreakdownApp(ctk.CTk):
             self.run_btn.configure(state="disabled")
 
     def open_downloads(self):
-        downloads_dir = os.path.join(os.getcwd(), 'downloads')
+        downloads_dir = os.path.join(os.getcwd(), "downloads")
         os.makedirs(downloads_dir, exist_ok=True)
-        if os.name == 'nt':
+        if os.name == "nt":
             os.startfile(downloads_dir)
-        elif sys.platform == 'darwin':
+        elif sys.platform == "darwin":
             import subprocess
-            subprocess.Popen(['open', downloads_dir])
+            subprocess.Popen(["open", downloads_dir])
         else:
             import subprocess
-            subprocess.Popen(['xdg-open', downloads_dir])
+            subprocess.Popen(["xdg-open", downloads_dir])
 
     # ── Options ───────────────────────────────────────────────────────────────
 
@@ -243,25 +313,27 @@ class FilmBreakdownApp(ctk.CTk):
     # ── Analysis control ──────────────────────────────────────────────────────
 
     def _show_success_dialog(self, xlsx_path):
-        """Show completion dialog with an Open Spreadsheet button. Called on main thread."""
+        """Completion dialog — called on main thread."""
         dialog = ctk.CTkToplevel(self)
-        dialog.title("Film Breakdown Complete")
-        dialog.geometry("420x160")
+        dialog.title("Complete")
+        dialog.geometry("420x150")
         dialog.resizable(False, False)
+        dialog.configure(fg_color=PARCHMENT)
         dialog.lift()
         dialog.focus()
 
         ctk.CTkLabel(
-            dialog, text="Film Breakdown completed!",
-            font=("Arial", 15, "bold")
+            dialog, text="BREAKDOWN COMPLETE",
+            font=ctk.CTkFont(family="Georgia", size=15, weight="bold"),
+            text_color=NEAR_BLACK,
         ).pack(pady=(22, 4))
         ctk.CTkLabel(
             dialog, text=str(xlsx_path),
-            font=("Arial", 10), text_color="gray", wraplength=380
-        ).pack(pady=(0, 16))
+            font=ctk.CTkFont(size=10), text_color=WARM_GRAY, wraplength=380,
+        ).pack(pady=(0, 14))
 
-        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
-        btn_frame.pack()
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack()
 
         def open_xlsx():
             try:
@@ -271,31 +343,42 @@ class FilmBreakdownApp(ctk.CTk):
             dialog.destroy()
 
         ctk.CTkButton(
-            btn_frame, text="📊 Open Spreadsheet", command=open_xlsx,
-            fg_color="green", hover_color="darkgreen", width=160
-        ).pack(side="left", padx=8)
+            btn_row, text="Open Spreadsheet",
+            corner_radius=0, border_width=2, border_color=NEAR_BLACK,
+            fg_color=CRIMSON, hover_color="#6B1414",
+            text_color=PARCHMENT,
+            font=ctk.CTkFont(family="Georgia", size=12, weight="bold"),
+            width=150, height=36,
+            command=open_xlsx,
+        ).pack(side="left", padx=(0, 8))
+
         ctk.CTkButton(
-            btn_frame, text="Close", command=dialog.destroy, width=80
-        ).pack(side="left", padx=8)
+            btn_row, text="Close",
+            corner_radius=0, border_width=2, border_color=NEAR_BLACK,
+            fg_color=CARD_BG, hover_color="#EDE8DF",
+            text_color=NEAR_BLACK,
+            font=ctk.CTkFont(size=12),
+            width=80, height=36,
+            command=dialog.destroy,
+        ).pack(side="left")
 
     def cancel_analysis(self):
         self.cancel_event.set()
-        self.cancel_btn.configure(state="disabled", text="Cancelling...")
+        self.cancel_btn.configure(state="disabled", text="…")
         print("Cancellation requested...")
 
     def start_analysis_thread(self):
         self.cancel_event.clear()
 
-        # Capture UI values on the main thread before the worker starts
-        self._threshold_value   = PACE_THRESHOLD[int(self.threshold_slider.get())]
-        self._use_local_model   = bool(self.local_model_check.get())
-        self._transcribe_audio  = bool(self.dialogue_check.get())
-        self._use_gemini        = bool(self.gemini_check.get())
-        self._flash_suppression = bool(self.flash_check.get())
+        self._threshold_value  = PACE_THRESHOLD[int(self.threshold_slider.get())]
+        self._use_local_model  = False   # Ollama removed from UI; set in .env if needed
+        self._transcribe_audio = bool(self.dialogue_check.get())
+        self._use_gemini       = bool(self.gemini_check.get())
+        self._flash_suppression = False  # accessible via CLI if needed
 
         self.select_btn.configure(state="disabled")
-        self.run_btn.configure(state="disabled", text="⏳ Analyzing...")
-        self.cancel_btn.configure(state="normal", text="✕ Cancel")
+        self.run_btn.configure(state="disabled", text="⏳  Analyzing…")
+        self.cancel_btn.configure(state="normal", text="✕")
         self.progress_bar.set(0)
         self.progress_label.configure(text="Shot 0 / 0")
 
@@ -308,56 +391,54 @@ class FilmBreakdownApp(ctk.CTk):
         thread.start()
 
     def _on_progress(self, current, total):
-        """Called from the worker thread — schedule the UI update on the main thread."""
         self.after(0, lambda c=current, t=total: self._update_progress_ui(c, t))
 
     def _update_progress_ui(self, current, total):
-        progress = current / total if total > 0 else 0
-        self.progress_bar.set(progress)
+        self.progress_bar.set(current / total if total > 0 else 0)
         self.progress_label.configure(text=f"Shot {current} / {total}")
 
     def run_analysis(self):
         try:
-            print("====================================")
-            print("Starting Film Breakdown Tool")
+            print("=" * 44)
+            print("  FILM BREAKDOWN — starting analysis")
+            print("=" * 44)
 
             target_path = self.video_path
             yt_url      = self.yt_entry.get().strip()
 
             if yt_url:
-                print(f"YouTube URL detected: {yt_url}")
-                print("Downloading video using yt-dlp...")
+                print(f"YouTube URL: {yt_url}")
+                print("Downloading via yt-dlp...")
 
                 deno_exe = os.path.join(os.getcwd(), "deno.exe")
                 if not os.path.exists(deno_exe) and os.name == "nt":
-                    print("\n[One-Time Setup]: Downloading tiny JS Runtime (Deno) to parse YouTube Age-Gates...")
-                    import urllib.request
-                    import zipfile
+                    print("\n[Setup] Downloading Deno JS runtime for YouTube age-gates...")
+                    import urllib.request, zipfile
                     try:
                         urllib.request.urlretrieve(
-                            'https://github.com/denoland/deno/releases/download/v2.1.2/deno-x86_64-pc-windows-msvc.zip',
-                            'deno.zip')
-                        with zipfile.ZipFile('deno.zip', 'r') as zip_ref:
-                            zip_ref.extractall(os.getcwd())
-                        os.remove('deno.zip')
-                        print("JS Runtime configured successfully!")
+                            "https://github.com/denoland/deno/releases/download/v2.1.2/deno-x86_64-pc-windows-msvc.zip",
+                            "deno.zip")
+                        with zipfile.ZipFile("deno.zip", "r") as z:
+                            z.extractall(os.getcwd())
+                        os.remove("deno.zip")
+                        print("Deno installed.")
                     except Exception as e:
-                        print(f"Warning: Could not auto-download JS Runtime: {e}")
+                        print(f"Warning: could not install Deno: {e}")
 
                 os.environ["PATH"] = os.getcwd() + os.pathsep + os.environ.get("PATH", "")
                 os.makedirs("downloads", exist_ok=True)
 
                 ydl_opts = {
-                    'format':          'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                    'outtmpl':         '%(title).50s [%(id)s]/%(title).50s [%(id)s].%(ext)s',
-                    'paths':           {'home': os.path.join(os.getcwd(), 'downloads')},
-                    'noplaylist':      True,
-                    'quiet':           False,
-                    'extractor_args':  {'youtube': {'player_client': ['default', 'tv']}},
-                    'writesubtitles':  True,
-                    'writeautomaticsub': True,
-                    'subtitleslangs':  ['en', 'en-US', 'en-GB'],
-                    'subtitlesformat': 'vtt'
+                    "format":          "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                    "outtmpl":         "%(title).50s [%(id)s]/%(title).50s [%(id)s].%(ext)s",
+                    "paths":           {"home": os.path.join(os.getcwd(), "downloads")},
+                    "noplaylist":      True,
+                    "quiet":           False,
+                    "extractor_args":  {"youtube": {"player_client": ["default", "tv"]}},
+                    "writesubtitles":  True,
+                    "writeautomaticsub": True,
+                    "subtitleslangs":  ["en", "en-US", "en-GB"],
+                    "subtitlesformat": "vtt",
                 }
 
                 try:
@@ -367,28 +448,26 @@ class FilmBreakdownApp(ctk.CTk):
                         print(f"Download complete: {target_path}")
                 except Exception as e:
                     err_msg = str(e).lower()
-                    if "confirm your age" in err_msg or "inappropriate for some users" in err_msg or "cookie" in err_msg:
+                    if "confirm your age" in err_msg or "inappropriate" in err_msg or "cookie" in err_msg:
                         download_success = False
                         if os.path.exists("cookies.txt"):
-                            print("\nAge-restricted video detected; found local 'cookies.txt'. Using that...")
+                            print("\nAge-restricted — using cookies.txt...")
                             ydl_opts["cookiefile"] = os.path.join(os.getcwd(), "cookies.txt")
                             try:
                                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                                     info        = ydl.extract_info(yt_url, download=True)
                                     target_path = ydl.prepare_filename(info)
-                                    print(f"Download complete via cookies.txt: {target_path}")
+                                    print(f"Download complete (cookies.txt): {target_path}")
                                 download_success = True
                             except Exception as cookies_txt_err:
-                                print(f"Failed using cookies.txt: {cookies_txt_err}")
+                                print(f"cookies.txt failed: {cookies_txt_err}")
 
                         if not download_success:
-                            print("\nAttempting to bypass using local browser cookies...")
-
+                            print("\nTrying browser cookies...")
                             arc_dirs = glob.glob(os.path.join(
                                 os.environ.get("LOCALAPPDATA", ""),
                                 "Packages", "TheBrowserCompany.Arc*",
                                 "LocalCache", "Local", "Arc", "User Data"))
-
                             browsers_to_try = []
                             if arc_dirs:
                                 browsers_to_try.append(("chrome", arc_dirs[0]))
@@ -396,40 +475,38 @@ class FilmBreakdownApp(ctk.CTk):
 
                             success = False
                             for browser_cfg in browsers_to_try:
-                                browser_name = browser_cfg[0] if len(browser_cfg) == 1 else "arc"
-                                print(f"Trying to extract logged-in cookies from: {browser_name.upper()}...")
+                                bname = browser_cfg[0] if len(browser_cfg) == 1 else "arc"
+                                print(f"  Trying {bname.upper()} cookies...")
                                 ydl_opts["cookiesfrombrowser"] = browser_cfg
                                 try:
                                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                                         info        = ydl.extract_info(yt_url, download=True)
                                         target_path = ydl.prepare_filename(info)
-                                        print(f"Download complete via {browser_name.upper()} cookies: {target_path}")
+                                        print(f"  Downloaded via {bname.upper()}: {target_path}")
                                         success = True
                                         break
-                                except Exception as browser_err:
-                                    browser_err_msg = str(browser_err).lower()
-                                    if "permission denied" in browser_err_msg or "locked" in browser_err_msg:
+                                except Exception as be:
+                                    bem = str(be).lower()
+                                    if "permission denied" in bem or "locked" in bem:
                                         raise PermissionError(
-                                            f"Your {browser_name.upper()} browser is actively locking its cookie database! "
-                                            "Please completely CLOSE your browser (all windows) and hit Start again.")
-                                    print(f"Failed extracting from {browser_name.upper()}: {browser_err}")
+                                            f"{bname.upper()} is locking its cookie database. "
+                                            "Close all browser windows and retry.")
+                                    print(f"  {bname.upper()} failed: {be}")
 
                             download_success = success
 
                         if not download_success:
                             raise Exception(
-                                "Failed to bypass age-restriction. Please either:\n"
-                                "1. Install the 'Get cookies.txt LOCALLY' extension, export your YouTube cookies, "
-                                "and save them as 'cookies.txt' in this directory.\n"
-                                "2. Or, log into YouTube on Microsoft Edge and let the script run.")
+                                "Age-restriction bypass failed.\n"
+                                "Export YouTube cookies via 'Get cookies.txt LOCALLY' and save as cookies.txt, "
+                                "or log into YouTube on Edge and retry.")
                     else:
                         raise e
 
             if not target_path or not os.path.exists(target_path):
-                raise ValueError("No valid video file could be found to process.")
+                raise ValueError("No valid video file found.")
 
-            print(f"Target: {target_path}")
-            print("====================================\n")
+            print(f"\nTarget: {target_path}\n")
 
             result_warnings = analyze_video(
                 target_path,
@@ -444,12 +521,12 @@ class FilmBreakdownApp(ctk.CTk):
             )
 
             if self.cancel_event.is_set():
-                print("\n⚠️ Analysis cancelled. Progress saved — re-run to resume.")
+                print("\n— Analysis cancelled. Progress saved.")
                 messagebox.showinfo(
                     "Cancelled",
-                    "Analysis cancelled. Progress has been saved.\nRe-run the same video to resume.")
+                    "Analysis cancelled.\nRe-run the same video to resume.")
             else:
-                print("\n✅ Process Completed Successfully!")
+                print("\n— Done.")
                 if result_warnings:
                     for w in result_warnings:
                         messagebox.showwarning("Warning", w)
@@ -458,12 +535,12 @@ class FilmBreakdownApp(ctk.CTk):
                 self.after(0, lambda p=xlsx_path: self._show_success_dialog(p))
 
         except Exception as e:
-            print(f"\n❌ Error during execution: {e}")
+            print(f"\n! Error: {e}")
             messagebox.showerror("Error", f"An error occurred:\n{e}")
         finally:
             self.select_btn.configure(state="normal")
-            self.run_btn.configure(state="normal", text="▶ Start Breakdown Analysis")
-            self.cancel_btn.configure(state="disabled", text="✕ Cancel")
+            self.run_btn.configure(state="normal", text="▶  START BREAKDOWN")
+            self.cancel_btn.configure(state="disabled", text="✕")
 
     def destroy(self):
         sys.stdout = self.original_stdout
@@ -471,7 +548,7 @@ class FilmBreakdownApp(ctk.CTk):
 
 
 class OutputRedirector:
-    """Thread-safe stdout redirect — schedules all writes on the Tk main thread."""
+    """Thread-safe stdout redirect to the status log."""
     def __init__(self, text_widget, app):
         self.text_widget = text_widget
         self.app         = app
