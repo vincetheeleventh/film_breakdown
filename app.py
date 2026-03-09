@@ -312,7 +312,7 @@ class FilmBreakdownApp(ctk.CTk):
 
                 ydl_opts = {
                     'format':          'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                    'outtmpl':         '%(title)s [%(id)s]/%(title)s [%(id)s].%(ext)s',
+                    'outtmpl':         '%(title).50s [%(id)s]/%(title).50s [%(id)s].%(ext)s',
                     'paths':           {'home': os.path.join(os.getcwd(), 'downloads')},
                     'noplaylist':      True,
                     'quiet':           False,

@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import openai
 from scenedetect import open_video, SceneManager
-from scenedetect.detectors import ContentDetector
+from scenedetect.detectors import ContentDetector, AdaptiveDetector
 from dotenv import load_dotenv
 import time
 import re
@@ -27,7 +27,7 @@ MOONSHOT_MODEL = os.environ.get("MOONSHOT_MODEL", "moonshot-v1-8k-vision-preview
 LOCAL_MODEL    = os.environ.get("LOCAL_MODEL",    "llava")
 LOCAL_BASE_URL = os.environ.get("LOCAL_BASE_URL", "http://localhost:11434/v1")
 MAX_WORKERS    = int(os.environ.get("ANALYSIS_WORKERS", "4"))
-GEMINI_MODEL   = os.environ.get("GEMINI_MODEL",   "gemini-2.0-flash")
+GEMINI_MODEL   = os.environ.get("GEMINI_MODEL",   "gemini-3.1-flash-lite-preview")
 
 def get_shot_schema():
     return {
@@ -321,16 +321,21 @@ def analyze_with_gemini(video_path: str, shot_meta: list,
         "dolly in/out, handheld, crane/jib). "
         "Give recurring characters consistent descriptive names (e.g. 'Man in Grey Suit') "
         "so they can be tracked across the whole film.\n\n"
+        "Also pick the single most representative/informative frame timestamp within each shot "
+        "for a screencap — a frame that best captures the composition, action, or character. "
+        "Return this as representative_timestamp (seconds as a float).\n\n"
         "Output ONLY a valid JSON array — no markdown, no extra text:\n"
         "[\n"
         '  {"shot_number": 1, "shot_type": "...", "whats_depicted": "...", '
-        '"camera_movement": "...", "characters_in_shot": [{"name": "...", "description": "..."}]},\n'
+        '"camera_movement": "...", "representative_timestamp": 4.5, '
+        '"characters_in_shot": [{"name": "...", "description": "..."}]},\n'
         "  ...\n"
         "]"
     )
 
-    # ── Generate ──────────────────────────────────────────────────────────────
-    print(f"Sending {len(shot_meta)}-shot analysis request to Gemini...")
+    # Dynamic token budget: ~350 tokens per shot, clamped to model limits
+    max_output_tokens = min(65536, max(8192, len(shot_meta) * 350))
+    print(f"Sending {len(shot_meta)}-shot analysis request to Gemini (max_tokens={max_output_tokens})...")
     try:
         response = client.models.generate_content(
             model=GEMINI_MODEL,
@@ -340,7 +345,7 @@ def analyze_with_gemini(video_path: str, shot_meta: list,
             ],
             config=genai_types.GenerateContentConfig(
                 temperature=0.2,
-                max_output_tokens=8192,
+                max_output_tokens=max_output_tokens,
             ),
         )
     except Exception as e:
@@ -371,13 +376,16 @@ def analyze_with_gemini(video_path: str, shot_meta: list,
         idx = shot_num - 1
         if 0 <= idx < len(shot_meta):
             results[idx] = {
-                "shot_type":          item.get("shot_type", ""),
-                "whats_depicted":     item.get("whats_depicted", ""),
-                "camera_movement":    item.get("camera_movement", ""),
-                "characters_in_shot": item.get("characters_in_shot", []),
+                "shot_type":                item.get("shot_type", ""),
+                "whats_depicted":           item.get("whats_depicted", ""),
+                "camera_movement":          item.get("camera_movement", ""),
+                "characters_in_shot":       item.get("characters_in_shot", []),
+                "representative_timestamp": item.get("representative_timestamp"),
             }
 
     print(f"Gemini returned analysis for {len(results)}/{len(shot_meta)} shots.")
+    if not results:
+        print("WARNING: Gemini returned no usable results. Check your API key/quota.")
     if progress_callback:
         progress_callback(len(shot_meta), len(shot_meta))
     return results
@@ -408,21 +416,35 @@ def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 2
             print(f"Could not load resume file, starting fresh: {e}")
 
     # ── Detect scenes ─────────────────────────────────────────────────────────
-    # Single detector with min_scene_len prevents duplicate/micro-scenes that
-    # arise when multiple detectors fire at slightly different frame offsets
-    # for the same cut.
-    # Flash suppression raises min_scene_len to ~1.5s (45 frames at 30fps),
-    # filtering out false cuts caused by strobe/flash effects.
+    # ContentDetector catches hard cuts; AdaptiveDetector catches dissolves /
+    # crossfades by comparing each frame's delta against the local rolling mean.
+    # Using both together can produce micro-scenes (1–10 frames) when the two
+    # detectors fire at slightly different offsets for the same transition, so
+    # we deduplicate those with a post-pass.
+    # Flash suppression raises min_scene_len to ~1.5 s (45 frames at 30 fps)
+    # to suppress false cuts from strobe/flash effects.
     min_scene_len = 45 if flash_suppression else 4
     if flash_suppression:
-        print(f"Detecting scenes (pace threshold={threshold:.0f}, flash suppression ON)...")
+        print(f"Detecting scenes (threshold={threshold:.0f}, flash suppression ON)...")
     else:
-        print(f"Detecting scenes (pace threshold={threshold:.0f})...")
+        print(f"Detecting scenes (threshold={threshold:.0f})...")
     video_stream = open_video(video_path)
     scene_mgr    = SceneManager()
     scene_mgr.add_detector(ContentDetector(threshold=threshold, min_scene_len=min_scene_len))
+    scene_mgr.add_detector(AdaptiveDetector(adaptive_threshold=3.0, min_scene_len=min_scene_len))
     scene_mgr.detect_scenes(video_stream, show_progress=False)
     scene_list = scene_mgr.get_scene_list()
+
+    # Dedup: merge any scene shorter than 10 frames — these are artefacts of
+    # two detectors firing a few frames apart for the same transition.
+    deduped = []
+    for scene in scene_list:
+        dur = scene[1].get_frames() - scene[0].get_frames()
+        if deduped and dur < 10:
+            deduped[-1] = (deduped[-1][0], scene[1])
+        else:
+            deduped.append(scene)
+    scene_list = deduped
     print(f"Detected {len(scene_list)} scenes.")
 
     cap = cv2.VideoCapture(video_path)
@@ -461,8 +483,15 @@ def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 2
             whisper_executor = ThreadPoolExecutor(max_workers=1)
             whisper_future   = whisper_executor.submit(run_whisperx_transcription, video_path)
 
-    # ── Phase 1: Extract all keyframes (sequential; cv2 is not thread-safe) ──
-    print("Extracting keyframes...")
+    # ── Phase 1: Build shot index (Gemini path defers keyframe extraction) ──
+    # For Gemini: skip frame extraction here — Gemini will supply representative
+    # timestamps and we extract exactly one keyframe per shot after analysis.
+    # For Moonshot/Ollama: extract keyframes now as they're needed for per-frame API calls.
+    gemini_deferred = use_gemini and not mock_test
+    if gemini_deferred:
+        print("Building shot index (keyframes will be extracted after Gemini analysis)...")
+    else:
+        print("Extracting keyframes...")
     shot_meta = []
 
     for i, scene in enumerate(scenes_to_process):
@@ -479,24 +508,25 @@ def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 2
         end_frame      = scene[1].get_frames()
         duration_frames = end_frame - start_frame
 
-        target_frame = start_frame + 8
-        if target_frame >= end_frame:
-            target_frame = start_frame + (duration_frames // 2)
-
-        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-        ret, frame = cap.read()
-
         keyframe_path = ""
-        if ret:
-            proposed_path = output_dir / f"shot_{i:04d}.jpg"
-            ok, buf = cv2.imencode('.jpg', frame)
-            if ok:
-                proposed_path.write_bytes(buf.tobytes())
-                keyframe_path = str(proposed_path)
+        if not gemini_deferred:
+            target_frame = start_frame + 8
+            if target_frame >= end_frame:
+                target_frame = start_frame + (duration_frames // 2)
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            ret, frame = cap.read()
+
+            if ret:
+                proposed_path = output_dir / f"shot_{i:04d}.jpg"
+                ok, buf = cv2.imencode('.jpg', frame)
+                if ok:
+                    proposed_path.write_bytes(buf.tobytes())
+                    keyframe_path = str(proposed_path)
+                else:
+                    print(f"Warning: Could not encode frame for shot {i+1}")
             else:
-                print(f"Warning: Could not encode frame for shot {i+1}")
-        else:
-            print(f"Warning: Could not extract frame for shot {i+1}")
+                print(f"Warning: Could not extract frame for shot {i+1}")
 
         shot_dialogue = [
             t['text'].replace('\n', ' ')
@@ -555,6 +585,16 @@ def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 2
             gemini_results = analyze_with_gemini(
                 video_path, shots_needing_analysis, cancel_event, progress_callback)
             results.update(gemini_results)
+
+            if not gemini_results:
+                warnings.append(
+                    "Gemini returned no results — all shots will show ERROR.\n\n"
+                    "Likely causes:\n"
+                    "  • API quota exhausted or billing not yet active\n"
+                    "  • GEMINI_API_KEY not set or incorrect\n"
+                    "  • Gemini response was too long (try a shorter video first)\n\n"
+                    "Check the log for details."
+                )
             try:
                 sidecar_path.write_text(json.dumps({
                     "video_path": video_path,
@@ -570,6 +610,32 @@ def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 2
         if cancel_event and cancel_event.is_set():
             print("\nAnalysis cancelled.")
             return None
+
+        # ── Unified Gemini keyframe extraction ───────────────────────────────
+        # Single pass: one keyframe per shot, at Gemini's representative timestamp.
+        # Falls back to shot midpoint when no timestamp is available.
+        # Using `results` (not gemini_results) covers both fresh and resumed runs.
+        print("Extracting keyframes from Gemini timestamps...")
+        cap_kf = cv2.VideoCapture(video_path)
+        fps_kf = cap_kf.get(cv2.CAP_PROP_FPS) or 30.0
+        for meta in shot_meta:
+            r = results.get(meta["index"])
+            if r and r.get("representative_timestamp") is not None:
+                ts = float(r["representative_timestamp"])
+                ts = max(meta["start_sec"], min(ts, meta["end_sec"] - 0.05))
+            else:
+                ts = (meta["start_sec"] + meta["end_sec"]) / 2
+            cap_kf.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps_kf))
+            ret, frame = cap_kf.read()
+            if ret:
+                kp = output_dir / f"shot_{meta['index']:04d}.jpg"
+                ok, buf = cv2.imencode('.jpg', frame)
+                if ok:
+                    kp.write_bytes(buf.tobytes())
+                    meta["keyframe_path"] = str(kp)
+            else:
+                print(f"Warning: Could not extract keyframe for shot {meta['index']+1}")
+        cap_kf.release()
 
     else:
         # ── Moonshot / Ollama per-frame analysis ─────────────────────────────
