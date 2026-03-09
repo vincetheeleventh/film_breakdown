@@ -132,6 +132,7 @@ class FilmBreakdownApp(ctk.CTk):
             text="Use Gemini Video AI  (uploads full video; sees motion & character continuity)")
         self.gemini_check.grid(
             row=4, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="w")
+        self.gemini_check.select()
 
         self.flash_check = ctk.CTkCheckBox(
             self.options_frame,

@@ -311,30 +311,40 @@ def analyze_with_gemini(video_path: str, shot_meta: list,
     )
 
     prompt = (
-        "You are a professional filmmaker creating a shot-by-shot breakdown.\n\n"
+        "You are a film analyst and cinematographer studying how this film communicates "
+        "its themes, characters, emotions, and story — visually and through time, via "
+        "editing rhythm and pacing. Your goal is to understand the craft: what each shot "
+        "does, why it is constructed the way it is, and what effect it produces in the viewer. "
+        "Pay special attention to technique and its emotional or narrative consequences.\n\n"
         "The following shots have been detected in this video:\n"
         f"{shot_list_str}\n\n"
-        "For each shot, watch what actually happens between those timestamps — "
-        "observe character ACTIONS (not just poses), the shot type "
-        "(close-up, medium, wide, two-shot, over-the-shoulder, POV, insert, etc.), "
-        "and the camera movement (static, pan left/right, tilt up/down, zoom in/out, "
-        "dolly in/out, handheld, crane/jib). "
+        "For each shot, carefully observe and describe:\n"
+        "  • shot_type: close-up, medium, wide, two-shot, over-the-shoulder, POV, insert, aerial, etc.\n"
+        "  • whats_depicted: a rich description of what you see — foreground and background subjects, "
+        "their scale and position in the frame, key actions or gestures, lighting quality, color palette, "
+        "and any significant visual detail. Be specific and evocative.\n"
+        "  • camera_movement: static, pan left/right, tilt up/down, zoom in/out, dolly in/out, "
+        "handheld, crane/jib, whip pan, etc. Note if movement is fast, slow, or imperceptible.\n"
+        "  • story_commentary: how does this shot build on, advance, or reframe the story so far? "
+        "Consider: what it reveals about character psychology or relationships, what emotion it evokes "
+        "and how the composition/framing achieves that, what information or tension it adds, and how "
+        "the editing choice (cut type, pacing, juxtaposition with the previous shot) shapes meaning.\n\n"
         "Give recurring characters consistent descriptive names (e.g. 'Man in Grey Suit') "
         "so they can be tracked across the whole film.\n\n"
         "Also pick the single most representative/informative frame timestamp within each shot "
-        "for a screencap — a frame that best captures the composition, action, or character. "
+        "for a screencap — a frame that best captures the composition, character, or key moment. "
         "Return this as representative_timestamp (seconds as a float).\n\n"
         "Output ONLY a valid JSON array — no markdown, no extra text:\n"
         "[\n"
         '  {"shot_number": 1, "shot_type": "...", "whats_depicted": "...", '
-        '"camera_movement": "...", "representative_timestamp": 4.5, '
+        '"camera_movement": "...", "story_commentary": "...", "representative_timestamp": 4.5, '
         '"characters_in_shot": [{"name": "...", "description": "..."}]},\n'
         "  ...\n"
         "]"
     )
 
-    # Dynamic token budget: ~350 tokens per shot, clamped to model limits
-    max_output_tokens = min(65536, max(8192, len(shot_meta) * 350))
+    # Dynamic token budget: ~500 tokens per shot (richer descriptions), clamped to model limits
+    max_output_tokens = min(65536, max(8192, len(shot_meta) * 500))
     print(f"Sending {len(shot_meta)}-shot analysis request to Gemini (max_tokens={max_output_tokens})...")
     try:
         response = client.models.generate_content(
@@ -384,6 +394,7 @@ def analyze_with_gemini(video_path: str, shot_meta: list,
                 "shot_type":                item.get("shot_type", ""),
                 "whats_depicted":           item.get("whats_depicted", ""),
                 "camera_movement":          item.get("camera_movement", ""),
+                "story_commentary":         item.get("story_commentary", ""),
                 "characters_in_shot":       item.get("characters_in_shot", []),
                 "representative_timestamp": item.get("representative_timestamp"),
             }
@@ -750,9 +761,10 @@ def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 2
             "End Time (s)":       round(meta["end_sec"], 2),
             "Shot Length (s)":    round(meta["duration_sec"], 2),
             "Shot Length (frames)": meta["duration_frames"],
-            "Shot Type":          ar.get("shot_type",      "ERROR") if ar else "ERROR",
-            "What's Depicted":    ar.get("whats_depicted", "ERROR") if ar else "ERROR",
-            "Camera Movement":    ar.get("camera_movement","ERROR") if ar else "ERROR",
+            "Shot Type":          ar.get("shot_type",         "ERROR") if ar else "ERROR",
+            "What's Depicted":    ar.get("whats_depicted",    "ERROR") if ar else "ERROR",
+            "Camera Movement":    ar.get("camera_movement",   "ERROR") if ar else "ERROR",
+            "Story Commentary":   ar.get("story_commentary",  "")      if ar else "",
             "Dialogue":           meta["dialogue"],
             "Characters":         char_names,
             "Keyframe Path":      meta["keyframe_path"],
@@ -775,7 +787,7 @@ def analyze_video(video_path: str, mock_test: bool = False, threshold: float = 2
     worksheet.set_column('A:A', 68)
     worksheet.set_column('B:F', 15)
     wrap_format = workbook.add_format({'text_wrap': True, 'valign': 'vcenter'})
-    worksheet.set_column('G:K', 40, wrap_format)
+    worksheet.set_column('G:L', 40, wrap_format)
 
     first_keyframe = shot_data[0]["Keyframe Path"] if shot_data else ""
     row_height = 140
