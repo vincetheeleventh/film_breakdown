@@ -1,0 +1,16 @@
+[project]
+name = "film-study-tool"
+version = "0.1.0"
+description = "Turn a short film into a shot-by-shot study workbook."
+requires-python = ">=3.10"
+dependencies = [
+  "pillow>=10.0",
+]
+
+[project.scripts]
+film-study = "film_study_tool.cli:main"
+film-study-ui = "film_study_tool.ui_server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#10141a">
+    <title>Film Study Tool</title>
+    <link rel="icon" href="/static/icons/wheel-favicon.png" type="image/png">
+    <link rel="apple-touch-icon" href="/static/icons/wheel-192.png">
+    <link rel="manifest" href="/static/manifest.webmanifest?v=20260713-wheel">
+    <link rel="stylesheet" href="/static/styles.css?v=20260713-full-video">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <h1>Film Study</h1>
+          <p id="projectMeta">Loading projects...</p>
+        </div>
+        <div class="toolbar" aria-label="Project controls">
+          <button id="homeButton" class="ghost-button" type="button">Library</button>
+          <select id="projectSelect" aria-label="Project"></select>
+          <button id="editToggle" class="ghost-button" type="button">Edit</button>
+          <button id="saveButton" class="primary-button" type="button" disabled>Save Corrections</button>
+        </div>
+      </header>
+
+      <section id="homeView" class="home-view">
+        <section class="home-intake" aria-label="Create studies">
+          <div class="upload-panel">
+            <div id="uploadDrop" class="upload-drop" role="button" tabindex="0">
+              <input id="uploadInput" type="file" accept="video/mp4,video/quicktime,video/webm,video/x-matroska" hidden>
+              <strong>Drop video</strong>
+              <span>or click to choose</span>
+            </div>
+          </div>
+          <section class="channel-import" aria-label="Channel import">
+            <label>
+              Link or copied list
+              <textarea id="channelUrlField" rows="3" placeholder="Paste one video URL, a channel URL, or a copied block of links"></textarea>
+            </label>
+            <div class="channel-import-row">
+              <label>
+                Videos
+                <select id="channelLimitField">
+                  <option value="5">Most popular 5</option>
+                  <option value="10">Most popular 10</option>
+                </select>
+              </label>
+              <button id="importChannelButton" class="primary-button" type="button">Import Links</button>
+            </div>
+          </section>
+        </section>
+        <div id="uploadStatus" class="upload-status" aria-live="polite"></div>
+        <section id="filmGrid" class="film-grid" aria-label="Past film breakdowns"></section>
+      </section>
+
+      <section id="studyView" class="study-view" hidden>
+        <section class="status-row" aria-live="polite">
+          <div id="statusText">Preparing the shot board.</div>
+          <div id="studySourcePanel" class="study-source-panel" hidden>
+            <a id="sourceLink" class="source-link" href="#" target="_blank" rel="noreferrer">Open Original</a>
+            <div id="socialStats" class="social-stats"></div>
+          </div>
+          <div id="editHelp" class="edit-help" hidden>
+            Select adjacent shots to combine or link. Drag selected shots onto an existing sentence to move them there.
+          </div>
+        </section>
+
+        <section id="fullVideoPanel" class="full-video-panel" hidden>
+          <header class="full-video-header">
+            <div>
+              <strong>Full Video</strong>
+              <span>Watch the entire film without leaving the study.</span>
+            </div>
+            <button id="fullVideoToggle" type="button">Watch Full Video</button>
+          </header>
+          <div id="fullVideoFrame" class="full-video-frame" hidden>
+            <video id="fullVideo" playsinline controls preload="metadata"></video>
+          </div>
+        </section>
+
+        <section class="edit-panel" id="editPanel" hidden>
+          <div class="selection-readout">
+            <strong id="selectionCount">0 selected</strong>
+            <span id="selectionRange">Select shots to combine.</span>
+          </div>
+          <div class="edit-actions">
+            <button id="combineSelected" type="button" disabled>Combine Selected</button>
+            <button id="combineWithNext" type="button" disabled>Combine With Next</button>
+            <button id="linkSentence" type="button" disabled>Link as Sentence</button>
+            <button id="clearSelection" type="button">Clear</button>
+            <button id="undoEdit" type="button" disabled>Undo</button>
+          </div>
+        </section>
+
+        <section class="llm-panel">
+          <label class="llm-context">
+            Your read on the film
+            <textarea id="filmContextField" rows="4" placeholder="Paste your thoughts, hypotheses, motifs, causality notes, editing questions, or things you want the model to look for."></textarea>
+          </label>
+          <div class="llm-controls">
+            <label>
+              Video analysis model
+              <select id="modelField">
+                <option value="qwen3.7-plus" selected>Qwen 3.7 Plus - best default</option>
+                <option value="qwen3-vl-plus">Qwen 3 VL Plus - dedicated vision</option>
+                <option value="qwen3-vl-flash">Qwen 3 VL Flash - faster vision</option>
+                <option value="qwen-vl-max-latest">Qwen VL Max - legacy fallback</option>
+                <option value="qwen-vl-plus-latest">Qwen VL Plus - legacy fallback</option>
+              </select>
+            </label>
+            <button id="generateDetails" class="primary-button" type="button">Generate Shot Details</button>
+          </div>
+        </section>
+
+        <section id="shotGrid" class="shot-grid" aria-label="Shot overview"></section>
+      </section>
+    </main>
+
+    <section id="sentencePopover" class="sentence-popover" aria-label="Filmic sentence editor" hidden>
+      <div class="sentence-popover-card">
+        <div class="sentence-popover-header">
+          <span id="sentencePopoverLabel"></span>
+          <button id="closeSentencePopover" class="icon-button" type="button" aria-label="Close sentence editor">X</button>
+        </div>
+        <div id="sentencePopoverShots" class="sentence-popover-shots"></div>
+        <label>
+          Sentence Title
+          <input id="sentenceTitleField" type="text" autocomplete="off">
+        </label>
+        <label>
+          Beat
+          <input id="sentenceBeatField" type="text" autocomplete="off">
+        </label>
+        <label>
+          Idea / Description
+          <textarea id="sentenceIdeaField" rows="4"></textarea>
+        </label>
+        <div class="sentence-popover-actions">
+          <button id="selectSentenceShots" type="button">Select Shots</button>
+          <button id="removeSentence" type="button">Remove Sentence</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="detailView" class="detail-view" aria-modal="true" role="dialog" hidden>
+      <div class="detail-stage">
+        <button id="closeDetail" class="icon-button close-button" type="button" aria-label="Close detail view">X</button>
+        <button id="prevShot" class="nav-button nav-prev" type="button" aria-label="Previous shot">&lt;</button>
+        <figure class="shot-focus">
+          <img id="detailImage" alt="">
+          <video id="detailVideo" hidden playsinline controls></video>
+          <figcaption>
+            <div class="detail-meta-line">
+              <span id="detailCounter"></span>
+              <span id="detailTiming"></span>
+            </div>
+            <div id="detailSentenceTitle" class="detail-sentence-title" hidden></div>
+          </figcaption>
+        </figure>
+        <button id="nextShot" class="nav-button nav-next" type="button" aria-label="Next shot">&gt;</button>
+      </div>
+      <div class="notes-drawer">
+        <section class="split-panel">
+          <div class="split-actions">
+            <button id="playDetailShot" type="button">Play Shot</button>
+            <button id="stopDetailShot" type="button" hidden>Stop</button>
+            <button id="startScreencap" type="button">Change Screencap</button>
+            <button id="startSplit" type="button">Split Shot</button>
+            <button id="cancelSplit" type="button" hidden>Cancel Split</button>
+            <button id="applyScreencap" class="primary-button" type="button" hidden>Apply Screencap</button>
+            <button id="applySplit" class="primary-button" type="button" hidden>Apply Split</button>
+          </div>
+          <div id="splitControls" class="split-controls" hidden>
+            <label>
+              <span id="timelineControlLabel">Cut point</span>
+              <input id="splitSlider" type="range" min="0" max="1" step="0.01" value="0">
+            </label>
+            <div class="split-readout">
+              <button id="nudgeBack" type="button">-0.05s</button>
+              <strong id="splitTime">00:00:00.00</strong>
+              <button id="nudgeForward" type="button">+0.05s</button>
+            </div>
+          </div>
+        </section>
+        <div class="notes-grid">
+          <label>
+            Shot Title
+            <textarea id="titleField" rows="4"></textarea>
+          </label>
+          <label>
+            Notes
+            <textarea id="notesField" rows="4"></textarea>
+          </label>
+          <label>
+            Visual Description
+            <textarea id="visualField" rows="4"></textarea>
+          </label>
+          <label>
+            Audio / Dialogue
+            <textarea id="audioField" rows="4"></textarea>
+          </label>
+          <label>
+            Action / Camera
+            <textarea id="actionField" rows="4"></textarea>
+          </label>
+          <label>
+            Narrative Function
+            <textarea id="narrativeField" rows="4"></textarea>
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <script src="/static/app.js?v=20260713-full-video" type="module"></script>
+  </body>
+</html>

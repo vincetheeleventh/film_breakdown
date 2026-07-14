@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Film Study Tool</title>
+  <desc id="desc">A dark film study app icon with film frames, a play marker, and timeline analysis rows.</desc>
+  <defs>
+    <linearGradient id="bg" x1="80" y1="42" x2="432" y2="470" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#15212b"/>
+      <stop offset="0.54" stop-color="#22251d"/>
+      <stop offset="1" stop-color="#2a1913"/>
+    </linearGradient>
+    <linearGradient id="frame" x1="104" y1="102" x2="418" y2="390" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f4c96b"/>
+      <stop offset="1" stop-color="#d97b41"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="16" stdDeviation="14" flood-color="#05070a" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect x="44" y="44" width="424" height="424" rx="92" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="4"/>
+  <g filter="url(#shadow)">
+    <rect x="98" y="88" width="316" height="214" rx="38" fill="#0c1117" stroke="url(#frame)" stroke-width="14"/>
+    <rect x="128" y="122" width="44" height="38" rx="9" fill="#f4c96b"/>
+    <rect x="128" y="230" width="44" height="38" rx="9" fill="#f4c96b"/>
+    <rect x="340" y="122" width="44" height="38" rx="9" fill="#d97b41"/>
+    <rect x="340" y="230" width="44" height="38" rx="9" fill="#d97b41"/>
+    <rect x="193" y="121" width="126" height="148" rx="22" fill="#162333"/>
+    <path d="M237 158 L237 232 L294 195 Z" fill="#f4f0dd"/>
+  </g>
+  <g>
+    <rect x="96" y="326" width="320" height="34" rx="17" fill="#f4c96b"/>
+    <rect x="96" y="380" width="238" height="34" rx="17" fill="#e0564f"/>
+    <rect x="96" y="434" width="280" height="34" rx="17" fill="#74b06f"/>
+    <rect x="252" y="318" width="10" height="158" rx="5" fill="#f4f0dd"/>
+  </g>
+</svg>
