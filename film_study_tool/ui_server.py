@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import base64
+import hashlib
 import html as html_lib
 import json
 import mimetypes
@@ -25,7 +26,7 @@ from urllib.parse import unquote, urlparse
 
 from .cli import run as run_breakdown, write_manifest_csv
 from .models import Shot, ShotAnalysis
-from .video import VideoToolError, _require_binary, _run
+from .video import VideoToolError, _require_binary, _run, detect_shot_boundaries
 from .workbook import write_workbook
 
 
@@ -49,6 +50,12 @@ STUDY_CONTEXT_FILENAME = "study_context.txt"
 LAST_LLM_RESPONSE_FILENAME = "last_llm_response.json"
 LAST_LLM_ERROR_FILENAME = "last_llm_error.json"
 PROJECT_META_FILENAME = "project_meta.json"
+AI_SHOT_DETECTION_INSTRUCTIONS = """You are a meticulous film editor reviewing shot boundaries.
+Watch the complete attached video. Identify every visual transition between distinct shots, including hard cuts,
+dissolves, crossfades, fades, wipes, and transitions hidden by camera or subject motion. The visible SHOT label
+shows the user's current timeline segment; it is a reference, not proof that the segment contains only one shot.
+Return precise timestamps in seconds. Do not invent transitions for camera movement, reframing, animation within
+one composition, lighting changes, or subject movement. Return JSON only."""
 
 TIKTOK_POPULAR_OVERRIDES: dict[str, list[dict[str, object]]] = {
     "annalaura_art": [
@@ -548,6 +555,71 @@ def caption_text_for_shot(cues: list[dict[str, object]], start: float, end: floa
     return " ".join(parts)
 
 
+def load_project_caption_cues(project_dir: Path) -> list[dict[str, object]]:
+    captions_dir = project_dir / "captions"
+    if not captions_dir.is_dir():
+        return []
+    caption_files = sorted(
+        (path for path in captions_dir.iterdir() if path.suffix.lower() in {".vtt", ".srt"}),
+        key=lambda path: (
+            0 if path.name.lower().endswith(".en.vtt") else 1,
+            0 if ".en-" in path.name.lower() else 1,
+            path.name.lower(),
+        ),
+    )
+    for caption_path in caption_files:
+        cues = parse_caption_file(caption_path)
+        if cues:
+            return cues
+    return []
+
+
+def apply_caption_cues_to_rows(
+    rows: list[dict[str, object]],
+    cues: list[dict[str, object]],
+) -> int:
+    """Assign each caption cue to exactly one edited shot using the cue midpoint."""
+    if not rows or not cues:
+        return 0
+    shot_ranges = [
+        (
+            _seconds_from_timestamp(str(row.get("start", "00:00:00.000"))),
+            _seconds_from_timestamp(str(row.get("end", "00:00:00.000"))),
+        )
+        for row in rows
+    ]
+    assigned: list[list[str]] = [[] for _row in rows]
+    seen: list[set[str]] = [set() for _row in rows]
+    for cue in cues:
+        cue_start = float(cue.get("start", 0) or 0)
+        cue_end = float(cue.get("end", cue_start) or cue_start)
+        midpoint = (cue_start + cue_end) / 2
+        target_index = next(
+            (
+                index
+                for index, (start, end) in enumerate(shot_ranges)
+                if start <= midpoint < end or (index == len(shot_ranges) - 1 and midpoint == end)
+            ),
+            None,
+        )
+        if target_index is None:
+            continue
+        text = str(cue.get("text") or "").strip()
+        if text and text not in seen[target_index]:
+            seen[target_index].add(text)
+            assigned[target_index].append(text)
+
+    updated = 0
+    for index, row in enumerate(rows):
+        if is_manual_field(row, "audio_dialogue"):
+            continue
+        next_text = " ".join(assigned[index])
+        if str(row.get("audio_dialogue") or "") != next_text:
+            row["audio_dialogue"] = next_text
+            updated += 1
+    return updated
+
+
 def write_manifest_rows(project_dir: Path, rows: list[dict[str, object]], study_context: str = "") -> None:
     shots: list[Shot] = []
     analyses: dict[int, ShotAnalysis] = {}
@@ -592,20 +664,7 @@ def enrich_project_with_captions(project_dir: Path, video_path: Path) -> dict[st
     rows = load_json(manifest_path)
     if not isinstance(rows, list):
         return {"captionFiles": [path.name for path in copied_files], "cueCount": len(cues), "shotsUpdated": 0}
-    updated = 0
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        start = _seconds_from_timestamp(str(row.get("start", "00:00:00.000")))
-        end = _seconds_from_timestamp(str(row.get("end", "00:00:00.000")))
-        text = caption_text_for_shot(cues, start, end)
-        if not text:
-            continue
-        if is_placeholder_audio(row.get("audio_dialogue")):
-            row["audio_dialogue"] = text
-        elif text not in str(row.get("audio_dialogue") or ""):
-            row["audio_dialogue"] = f"{row.get('audio_dialogue')}\n\nCaptions: {text}"
-        updated += 1
+    updated = apply_caption_cues_to_rows(rows, cues)
     if updated:
         if manifest_path.name == "corrected_manifest.json":
             save_corrected_project(
@@ -783,9 +842,12 @@ def save_corrected_project(outputs_dir: Path, project_id: str, payload: dict[str
                 "camera_movement_evidence": normalized["camera_movement_evidence"],
                 "narrative_function": normalized["narrative_function"],
                 "notes": normalized["notes"],
+                "analysis_stale": normalized["analysis_stale"],
                 "manual_fields": normalized["manual_fields"],
             }
         )
+
+    apply_caption_cues_to_rows(corrected_rows, load_project_caption_cues(project_dir))
 
     corrected_manifest = project_dir / "corrected_manifest.json"
     corrected_manifest.write_text(json.dumps(corrected_rows, indent=2), encoding="utf-8")
@@ -870,9 +932,17 @@ def update_shots_with_llm_details(outputs_dir: Path, project_id: str, payload: d
             raise ValueError("Shot entries must be objects")
         normalized.append(normalize_shot_row(row, index, project_dir))
     outline = normalize_outline(payload.get("outline", load_outline(project_dir, len(normalized))), len(normalized))
+    source_video = find_source_video(project_id)
+    if source_video is None:
+        raise FileNotFoundError("Source video not found")
+    low_threshold_candidates = detect_shot_boundaries(source_video, threshold=0.12)
+    current_boundaries = [
+        _seconds_from_timestamp(str(row.get("end", "00:00:00.000")))
+        for row in normalized[:-1]
+    ]
 
     try:
-        llm_rows, provider_name, provider_model = generate_shot_details_with_native_video(
+        llm_rows, llm_transitions, provider_name, provider_model = generate_shot_details_with_native_video(
             model=model,
             qwen_api_key=qwen_api_key,
             gemini_api_key=gemini_api_key,
@@ -881,11 +951,37 @@ def update_shots_with_llm_details(outputs_dir: Path, project_id: str, payload: d
             shots=normalized,
             outline=outline,
             user_context=user_context,
+            ffmpeg_candidates=low_threshold_candidates,
         )
     except Exception as exc:
         write_llm_error(project_dir, model, exc)
         raise
     merged = merge_generated_shot_details(normalized, llm_rows)
+    apply_caption_cues_to_rows(merged, load_project_caption_cues(project_dir))
+    suggestions = normalize_ai_transition_suggestions(
+        llm_transitions,
+        normalized,
+        current_boundaries,
+        low_threshold_candidates,
+    )
+    for index, suggestion in enumerate(suggestions):
+        timestamp = float(suggestion["time_seconds"])
+        before = extract_project_frame(
+            outputs_dir,
+            project_id,
+            max(0, timestamp - 0.18),
+            f"analysis_cut_{index + 1}_before",
+            max_width=320,
+        )
+        after = extract_project_frame(
+            outputs_dir,
+            project_id,
+            timestamp + 0.18,
+            f"analysis_cut_{index + 1}_after",
+            max_width=320,
+        )
+        suggestion["beforeFrameUrl"] = before["screenshotUrl"]
+        suggestion["afterFrameUrl"] = after["screenshotUrl"]
     save_result = save_corrected_project(outputs_dir, project_id, {"shots": merged, "outline": outline})
     return {
         "ok": True,
@@ -893,16 +989,301 @@ def update_shots_with_llm_details(outputs_dir: Path, project_id: str, payload: d
         "shotCount": len(merged),
         "provider": provider_name,
         "model": provider_model,
+        "suggestions": suggestions,
+        "suggestionCount": len(suggestions),
         **save_result,
     }
+
+
+def ai_shot_boundary_suggestions(
+    outputs_dir: Path,
+    project_id: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    project_dir = safe_project_path(outputs_dir, project_id)
+    raw_shots = payload.get("shots")
+    if not isinstance(raw_shots, list) or not raw_shots:
+        raise ValueError("No current shots to review")
+    shots = [
+        normalize_shot_row(row, index, project_dir)
+        for index, row in enumerate(raw_shots)
+        if isinstance(row, dict)
+    ]
+    if len(shots) != len(raw_shots):
+        raise ValueError("Shot entries must be objects")
+
+    qwen_api_key = str(
+        os.environ.get("QWEN_API_KEY")
+        or os.environ.get("DASHSCOPE_API_KEY")
+        or os.environ.get("ALIBABA_CLOUD_API_KEY")
+        or ""
+    ).strip()
+    gemini_api_key = str(os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not qwen_api_key and not gemini_api_key:
+        raise ValueError("Add an Alibaba/Qwen key to .env, or add GEMINI_API_KEY for fallback.")
+
+    model = normalize_qwen_model(str(payload.get("model") or DEFAULT_QWEN_VIDEO_MODEL))
+    video_path = find_source_video(project_id)
+    if video_path is None:
+        raise FileNotFoundError("Source video not found")
+    low_threshold_candidates = detect_shot_boundaries(video_path, threshold=0.12)
+    current_boundaries = [
+        _seconds_from_timestamp(str(row.get("end", "00:00:00.000")))
+        for row in shots[:-1]
+    ]
+    prompt = build_ai_shot_detection_prompt(shots, current_boundaries, low_threshold_candidates)
+    analysis_video = prepare_analysis_video(project_dir, shots=shots)
+    if analysis_video is None:
+        raise FileNotFoundError("Source video not found for AI shot review")
+
+    errors: list[str] = []
+    provider = ""
+    provider_model = ""
+    raw_content = ""
+    if qwen_api_key:
+        try:
+            raw_content = call_qwen_video(
+                qwen_api_key,
+                model,
+                AI_SHOT_DETECTION_INSTRUCTIONS,
+                prompt,
+                analysis_video,
+            )
+            provider = "qwen"
+            provider_model = model
+        except Exception as exc:
+            errors.append(f"Qwen failed: {exc}")
+    if not raw_content and gemini_api_key:
+        gemini_model = os.environ.get("GEMINI_VIDEO_MODEL", DEFAULT_GEMINI_MODEL)
+        try:
+            raw_content = call_gemini_video(
+                gemini_api_key,
+                gemini_model,
+                AI_SHOT_DETECTION_INSTRUCTIONS,
+                prompt,
+                analysis_video,
+            )
+            provider = "gemini"
+            provider_model = gemini_model
+        except Exception as exc:
+            errors.append(f"Gemini failed: {exc}")
+    if not raw_content:
+        raise ValueError("AI shot review failed. " + " | ".join(errors))
+
+    (project_dir / "last_shot_detection_response.json").write_text(
+        json.dumps(
+            {
+                "provider": provider,
+                "model": provider_model,
+                "savedAt": datetime.now().isoformat(timespec="seconds"),
+                "content": raw_content,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    transitions = parse_ai_transitions(raw_content)
+    suggestions = normalize_ai_transition_suggestions(
+        transitions,
+        shots,
+        current_boundaries,
+        low_threshold_candidates,
+    )
+    for index, suggestion in enumerate(suggestions):
+        timestamp = float(suggestion["time_seconds"])
+        before = extract_project_frame(
+            outputs_dir,
+            project_id,
+            max(0, timestamp - 0.18),
+            f"ai_cut_{index + 1}_before",
+            max_width=320,
+        )
+        after = extract_project_frame(
+            outputs_dir,
+            project_id,
+            timestamp + 0.18,
+            f"ai_cut_{index + 1}_after",
+            max_width=320,
+        )
+        suggestion["beforeFrameUrl"] = before["screenshotUrl"]
+        suggestion["afterFrameUrl"] = after["screenshotUrl"]
+
+    return {
+        "ok": True,
+        "provider": provider,
+        "model": provider_model,
+        "suggestions": suggestions,
+        "suggestionCount": len(suggestions),
+        "currentBoundaryCount": len(current_boundaries),
+        "ffmpegCandidateCount": len(low_threshold_candidates),
+    }
+
+
+def build_ai_shot_detection_prompt(
+    shots: list[dict[str, object]],
+    current_boundaries: list[float],
+    ffmpeg_candidates: list[tuple[float, float]],
+) -> str:
+    timeline = [
+        {
+            "shot": index + 1,
+            "analysis_id": analysis_id_for_row(index),
+            "start": row.get("start", ""),
+            "end": row.get("end", ""),
+        }
+        for index, row in enumerate(shots)
+    ]
+    candidates = [
+        {"time_seconds": round(timestamp, 3), "scene_score": round(score, 4)}
+        for timestamp, score in ffmpeg_candidates
+    ]
+    return (
+        "Perform an independent editorial pass over the full video. The user's current boundaries and FFmpeg's "
+        "low-threshold candidates are supplied as evidence, but neither list is guaranteed complete or correct. "
+        "Look especially for gradual dissolves and crossfades that scene-score detection often misses.\n\n"
+        f"Current edited timeline:\n{json.dumps(timeline, indent=2)}\n\n"
+        f"Current boundary times in seconds:\n{json.dumps(current_boundaries)}\n\n"
+        f"Low-threshold FFmpeg candidates:\n{json.dumps(candidates, indent=2)}\n\n"
+        "Return every real transition you observe, including ones already represented by current boundaries. "
+        "Use one object per transition with: time_seconds, transition_type, confidence (high, medium, or low), "
+        "from_visual, to_visual, and reason. For a dissolve or crossfade, also include transition_start_seconds "
+        "and transition_end_seconds, and set time_seconds to its editorial midpoint. Return exactly "
+        '{"transitions": [...]}.'
+    )
+
+
+def parse_ai_transitions(raw_content: str) -> list[dict[str, object]]:
+    parsed = parse_llm_json(raw_content)
+    rows = first_list_value(parsed, ["transitions", "shot_boundaries", "boundaries", "cuts"])
+    if not isinstance(rows, list):
+        raise ValueError("AI shot review did not return a transitions array")
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def transition_seconds(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return _seconds_from_timestamp(text) if ":" in text else float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_ai_confidence(value: object) -> tuple[str, float]:
+    if isinstance(value, (int, float)):
+        score = max(0.0, min(1.0, float(value)))
+        return ("high" if score >= 0.78 else "medium" if score >= 0.52 else "low", score)
+    label = str(value or "medium").strip().lower()
+    if label not in {"high", "medium", "low"}:
+        label = "medium"
+    return label, {"high": 0.9, "medium": 0.65, "low": 0.35}[label]
+
+
+def normalize_split_details(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    fields = [
+        "shot_title",
+        "visual_description",
+        "audio_dialogue",
+        "action_camera",
+        "camera_movement_type",
+        "camera_movement_intensity",
+        "camera_movement_confidence",
+        "camera_movement_evidence",
+        "narrative_function",
+        "notes",
+    ]
+    details = {
+        field: str(value.get(field) or "").strip()
+        for field in fields
+        if str(value.get(field) or "").strip()
+    }
+    if "shot_title" in details:
+        details["shot_title"] = compact_shot_title(details["shot_title"])
+    return details
+
+
+def normalize_ai_transition_suggestions(
+    transitions: list[dict[str, object]],
+    shots: list[dict[str, object]],
+    current_boundaries: list[float],
+    ffmpeg_candidates: list[tuple[float, float]],
+) -> list[dict[str, object]]:
+    suggestions: list[dict[str, object]] = []
+    seen_times: list[float] = []
+    gradual_types = {"crossfade", "cross-fade", "dissolve", "fade", "fade_in", "fade_out", "wipe"}
+    for row in transitions:
+        timestamp = transition_seconds(
+            row.get("time_seconds") or row.get("timestamp") or row.get("time")
+        )
+        if timestamp is None or timestamp <= 0:
+            continue
+        transition_type = str(row.get("transition_type") or row.get("type") or "cut").strip().lower()
+        if any(abs(timestamp - boundary) <= 0.45 for boundary in current_boundaries):
+            continue
+        source_index = next(
+            (
+                index
+                for index, shot in enumerate(shots)
+                if _seconds_from_timestamp(str(shot["start"])) + 0.25 < timestamp
+                < _seconds_from_timestamp(str(shot["end"])) - 0.25
+            ),
+            None,
+        )
+        if source_index is None:
+            continue
+        if transition_type not in gradual_types:
+            nearby = [candidate for candidate in ffmpeg_candidates if abs(candidate[0] - timestamp) <= 0.75]
+            if nearby:
+                timestamp = max(nearby, key=lambda item: item[1])[0]
+        shot_start = _seconds_from_timestamp(str(shots[source_index]["start"]))
+        shot_end = _seconds_from_timestamp(str(shots[source_index]["end"]))
+        if not shot_start + 0.25 < timestamp < shot_end - 0.25:
+            continue
+        if any(abs(timestamp - boundary) <= 0.45 for boundary in current_boundaries):
+            continue
+        if any(abs(timestamp - prior) <= 0.35 for prior in seen_times):
+            continue
+        seen_times.append(timestamp)
+        confidence_label, confidence_score = normalize_ai_confidence(row.get("confidence"))
+        suggestions.append(
+            {
+                "id": f"ai-cut-{len(suggestions) + 1}",
+                "time_seconds": round(timestamp, 3),
+                "transition_type": transition_type.replace("_", " "),
+                "confidence": confidence_label,
+                "confidence_score": confidence_score,
+                "sourceShot": source_index + 1,
+                "from_visual": str(row.get("from_visual") or "").strip(),
+                "to_visual": str(row.get("to_visual") or "").strip(),
+                "reason": str(row.get("reason") or "").strip(),
+                "transition_start_seconds": transition_seconds(row.get("transition_start_seconds")),
+                "transition_end_seconds": transition_seconds(row.get("transition_end_seconds")),
+                "before_details": normalize_split_details(
+                    row.get("before_details") or row.get("before_shot")
+                ),
+                "after_details": normalize_split_details(
+                    row.get("after_details") or row.get("after_shot")
+                ),
+            }
+        )
+    return sorted(suggestions, key=lambda item: float(item["time_seconds"]))
 
 
 def merge_generated_shot_details(
     current_rows: list[dict[str, object]],
     generated_rows: list[dict[str, object]],
 ) -> list[dict[str, object]]:
+    by_analysis_id = {}
     by_number = {}
-    for row in generated_rows:
+    for index, row in enumerate(generated_rows):
+        analysis_id = str(row.get("analysis_id") or row.get("row_id") or "").strip()
+        if analysis_id:
+            by_analysis_id[analysis_id] = row
         for key in ("current_shot", "shot", "analysis_index"):
             try:
                 shot_number = int(row.get(key, 0))
@@ -927,8 +1308,16 @@ def merge_generated_shot_details(
     for index, row in enumerate(current_rows):
         next_row = dict(row)
         current_shot_number = safe_int(row.get("shot"), index + 1)
-        generated = by_number.get(current_shot_number, by_number.get(index + 1, {}))
-        force_refresh = bool(row.get("analysis_stale")) or is_structurally_edited_row(row, index)
+        analysis_id = analysis_id_for_row(index)
+        if by_analysis_id:
+            generated = by_analysis_id.get(analysis_id, {})
+        elif len(generated_rows) == len(current_rows):
+            # Models sometimes return old detector shot numbers after user edits.
+            # If the row count matches, the JSON array order is safer than the number field.
+            generated = generated_rows[index]
+        else:
+            generated = by_number.get(current_shot_number, by_number.get(index + 1, {}))
+        force_refresh = True
         maybe_merge_generated_field(next_row, generated, "shot_title", index, force_refresh=True)
         for field in detail_fields:
             maybe_merge_generated_field(next_row, generated, field, index, force_refresh=force_refresh)
@@ -1045,6 +1434,10 @@ def safe_int(value: object, fallback: int = 0) -> int:
         return fallback
 
 
+def analysis_id_for_row(index: int) -> str:
+    return f"row_{index + 1:04d}"
+
+
 def is_placeholder_field_value(field: str, value: str, index: int) -> bool:
     if field == "shot_title":
         return is_placeholder_shot_title(value, index)
@@ -1082,10 +1475,17 @@ def generate_shot_details_with_native_video(
     shots: list[dict[str, object]],
     outline: dict[str, object],
     user_context: str,
-) -> tuple[list[dict[str, object]], str, str]:
+    ffmpeg_candidates: list[tuple[float, float]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]], str, str]:
     instructions = LLM_INSTRUCTIONS_PATH.read_text(encoding="utf-8")
-    prompt = build_llm_text_prompt(project_name, shots, outline, user_context)
-    video_path = prepare_analysis_video(project_dir)
+    prompt = build_llm_text_prompt(
+        project_name,
+        shots,
+        outline,
+        user_context,
+        ffmpeg_candidates=ffmpeg_candidates,
+    )
+    video_path = prepare_analysis_video(project_dir, shots=shots)
     if video_path is None:
         raise FileNotFoundError("Source video not found for native video analysis")
 
@@ -1095,7 +1495,8 @@ def generate_shot_details_with_native_video(
         try:
             raw_content = call_qwen_video(qwen_api_key, qwen_model, instructions, prompt, video_path)
             write_llm_response(project_dir, qwen_model, raw_content, provider="qwen")
-            return parse_generated_shot_rows(raw_content), "qwen", qwen_model
+            rows, transitions = parse_generated_analysis(raw_content)
+            return rows, transitions, "qwen", qwen_model
         except Exception as exc:
             errors.append(f"Qwen failed: {exc}")
             write_llm_error(project_dir, qwen_model, exc, provider="qwen")
@@ -1105,7 +1506,8 @@ def generate_shot_details_with_native_video(
         try:
             raw_content = call_gemini_video(gemini_api_key, gemini_model, instructions, prompt, video_path)
             write_llm_response(project_dir, gemini_model, raw_content, provider="gemini")
-            return parse_generated_shot_rows(raw_content), "gemini", gemini_model
+            rows, transitions = parse_generated_analysis(raw_content)
+            return rows, transitions, "gemini", gemini_model
         except Exception as exc:
             errors.append(f"Gemini failed: {exc}")
             write_llm_error(project_dir, gemini_model, exc, provider="gemini")
@@ -1114,12 +1516,23 @@ def generate_shot_details_with_native_video(
 
 
 def parse_generated_shot_rows(raw_content: str) -> list[dict[str, object]]:
+    rows, _transitions = parse_generated_analysis(raw_content)
+    return rows
+
+
+def parse_generated_analysis(
+    raw_content: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     parsed = parse_llm_json(raw_content)
     rows = first_list_value(parsed, ["shots", "shot_details", "shotDetails", "rows", "items", "data"])
     if not isinstance(rows, list):
         keys = ", ".join(parsed.keys())
         raise ValueError(f"LLM response did not include a shots array. Returned keys: {keys or '(none)'}")
-    return [row for row in rows if isinstance(row, dict)]
+    transitions = first_list_value(parsed, ["transitions", "shot_boundaries", "boundaries", "cuts"])
+    return (
+        [row for row in rows if isinstance(row, dict)],
+        [row for row in transitions if isinstance(row, dict)] if isinstance(transitions, list) else [],
+    )
 
 
 def write_llm_response(project_dir: Path, model: str, raw_content: str, provider: str = "") -> None:
@@ -1155,54 +1568,76 @@ def build_llm_text_prompt(
     shots: list[dict[str, object]],
     outline: dict[str, object],
     user_context: str,
+    ffmpeg_candidates: list[tuple[float, float]] | None = None,
 ) -> str:
     compact_rows = []
     for index, shot in enumerate(shots):
-        members = source_members_for_row(shot)
-        source_range = ""
-        if members:
-            source_range = str(members[0]) if len(members) == 1 else f"{members[0]}-{members[-1]}"
         compact_rows.append(
             {
-                "shot": shot["shot"],
-                "current_shot": shot["shot"],
-                "source_members": members,
-                "source_range": source_range,
-                "was_combined_split_or_reordered": bool(shot.get("analysis_stale"))
-                or is_structurally_edited_row(shot, index),
-                "title": shot.get("shot_title", ""),
+                "analysis_id": analysis_id_for_row(index),
+                "shot": index + 1,
+                "current_shot": index + 1,
+                "was_combined_split_or_reordered": bool(shot.get("analysis_stale")) or is_structurally_edited_row(shot, index),
+                "title": shot.get("shot_title", "") if is_manual_field(shot, "shot_title") else "",
                 "start": shot.get("start", ""),
                 "end": shot.get("end", ""),
                 "duration_seconds": shot.get("duration_seconds", 0),
-                "existing_visual_description": shot.get("visual_description", ""),
+                "existing_visual_description": shot.get("visual_description", "") if is_manual_field(shot, "visual_description") else "",
                 "existing_audio_dialogue": shot.get("audio_dialogue", ""),
-                "existing_action_camera": shot.get("action_camera", ""),
-                "existing_camera_movement_type": shot.get("camera_movement_type", ""),
-                "existing_camera_movement_intensity": shot.get("camera_movement_intensity", ""),
-                "existing_camera_movement_confidence": shot.get("camera_movement_confidence", ""),
-                "existing_camera_movement_evidence": shot.get("camera_movement_evidence", ""),
-                "existing_narrative_function": shot.get("narrative_function", ""),
-                "existing_notes": shot.get("notes", ""),
+                "existing_action_camera": shot.get("action_camera", "") if is_manual_field(shot, "action_camera") else "",
+                "existing_camera_movement_type": shot.get("camera_movement_type", "") if is_manual_field(shot, "camera_movement_type") else "",
+                "existing_camera_movement_intensity": shot.get("camera_movement_intensity", "") if is_manual_field(shot, "camera_movement_intensity") else "",
+                "existing_camera_movement_confidence": shot.get("camera_movement_confidence", "") if is_manual_field(shot, "camera_movement_confidence") else "",
+                "existing_camera_movement_evidence": shot.get("camera_movement_evidence", "") if is_manual_field(shot, "camera_movement_evidence") else "",
+                "existing_narrative_function": shot.get("narrative_function", "") if is_manual_field(shot, "narrative_function") else "",
+                "existing_notes": shot.get("notes", "") if is_manual_field(shot, "notes") else "",
             }
         )
+    current_boundaries = [
+        round(_seconds_from_timestamp(str(row.get("end", "00:00:00.000"))), 3)
+        for row in shots[:-1]
+    ]
+    candidate_rows = [
+        {"time_seconds": round(timestamp, 3), "scene_score": round(score, 4)}
+        for timestamp, score in (ffmpeg_candidates or [])
+    ]
     return (
         f"Film: {project_name}\n\n"
         "User study notes / hypotheses:\n"
         f"{user_context or '(none provided)'}\n\n"
-        "Current corrected shot list. This is the authoritative shot sequence after the user's manual edits. "
-        "Use only these rows and these start/end timestamps for analysis. "
-        "The source_members/source_range values are old detector IDs for traceability only; do not output or follow "
-        "the old detector numbering or old cut boundaries. Return shot numbers that match current_shot/shot exactly:\n"
+        "Current corrected shot list. This is the only authoritative shot sequence after the user's manual edits. "
+        "Use only these rows, their analysis_id values, and these start/end timestamps for analysis. "
+        "Ignore any original detector numbering that may exist elsewhere; it is not part of this request. "
+        "Return one output row for each input row, in the same order, with the exact same analysis_id and current_shot/shot number:\n"
         f"{json.dumps(compact_rows, ensure_ascii=False, indent=2)}\n\n"
         "Current filmic sentence / beat outline. Use it as viewer context when present:\n"
         f"{json.dumps(outline, ensure_ascii=False, indent=2)}\n\n"
-        "The full video is attached to this request. Analyze each shot using the exact start/end timestamps above. "
+        "During this same viewing, independently check the current shot boundaries. Current boundaries in seconds:\n"
+        f"{json.dumps(current_boundaries)}\n\n"
+        "FFmpeg low-threshold candidates are local evidence, not guaranteed cuts:\n"
+        f"{json.dumps(candidate_rows, ensure_ascii=False, indent=2)}\n\n"
+        "Return every real visual transition you observe in a top-level transitions array, including transitions "
+        "already represented by the current boundaries. Look especially for dissolves, crossfades, fades, and "
+        "other gradual transitions that FFmpeg may miss. Do not treat camera movement, subject movement, animation "
+        "inside one composition, or lighting changes as cuts. Each transition object must contain time_seconds, "
+        "transition_type, confidence (high, medium, or low), from_visual, to_visual, and reason. For a gradual "
+        "transition, also include transition_start_seconds and transition_end_seconds.\n\n"
+        "For each transition that is more than 0.45 seconds away from every current boundary, it is a possible "
+        "missing cut inside one current shot. Include before_details and after_details objects for the two proposed "
+        "shots on either side. Each object must contain the same descriptive fields as a shot row, including a "
+        "1-to-7-word shot_title. This lets the app apply the cut and its details without another model request. "
+        "Do not include before_details or after_details for an existing current boundary.\n\n"
+        "The full video is attached to this request. Its top-left SHOT / row label is burned into every frame from "
+        "the user's current edited timeline. Use that visible label as the authoritative mapping for every title and "
+        "description; never carry an action forward or backward into a differently labeled shot. Analyze each shot "
+        "using the exact start/end timestamps above. "
         "Treat those timings as the user's corrected cut boundaries. For camera movement, watch the motion inside "
         "each time range and distinguish camera movement from actor, object, or edit movement.\n\n"
         "For every shot, generate shot_title as a concise card label of 1 to 7 words. "
         "Do not include the shot number in shot_title. Prefer concrete place/action/story language over generic labels.\n\n"
-        "Return exactly one JSON object with a top-level key named \"shots\". "
-        "The value must be an array with one object for every shot number, using the exact field names requested."
+        "Return exactly one JSON object with top-level keys named \"shots\" and \"transitions\". The shots value "
+        "must contain one object for every input row, using the exact field names requested. Every returned shot "
+        "must include analysis_id copied exactly from the input row."
     )
 
 
@@ -1231,18 +1666,87 @@ def normalize_qwen_model(model: str) -> str:
     return cleaned or os.environ.get("QWEN_VIDEO_MODEL", DEFAULT_QWEN_VIDEO_MODEL)
 
 
-def prepare_analysis_video(project_dir: Path, max_width: int = 640, fps: int = 8) -> Path | None:
+def ass_timestamp(seconds: float) -> str:
+    safe_seconds = max(0.0, seconds)
+    hours = int(safe_seconds // 3600)
+    minutes = int((safe_seconds % 3600) // 60)
+    remainder = safe_seconds - hours * 3600 - minutes * 60
+    return f"{hours}:{minutes:02d}:{remainder:05.2f}"
+
+
+def write_analysis_labels(path: Path, shots: list[dict[str, object]], width: int) -> None:
+    events = []
+    for index, row in enumerate(shots):
+        try:
+            start = _seconds_from_timestamp(str(row.get("start", "00:00:00.000")))
+            end = _seconds_from_timestamp(str(row.get("end", "00:00:00.000")))
+        except (TypeError, ValueError):
+            continue
+        events.append(
+            f"Dialogue: 0,{ass_timestamp(start)},{ass_timestamp(end)},ShotLabel,,0,0,0,,"
+            f"SHOT {index + 1:03d}  row_{index + 1:04d}"
+        )
+    content = "\n".join(
+        [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            f"PlayResX: {width}",
+            "PlayResY: 360",
+            "ScaledBorderAndShadow: yes",
+            "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+            "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+            "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+            "Style: ShotLabel,Arial,19,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,"
+            "-1,0,0,0,100,100,0,0,3,1,0,7,18,18,16,1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+            *events,
+            "",
+        ]
+    )
+    path.write_text(content, encoding="utf-8")
+
+
+def ffmpeg_filter_path(path: Path) -> str:
+    return str(path.resolve()).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
+def prepare_analysis_video(
+    project_dir: Path,
+    max_width: int = 640,
+    fps: int = 8,
+    shots: list[dict[str, object]] | None = None,
+) -> Path | None:
     video_path = find_source_video(project_dir.name)
     if video_path is None:
         return None
 
     analysis_dir = project_dir / "analysis_video"
     analysis_dir.mkdir(parents=True, exist_ok=True)
-    output_path = analysis_dir / f"{project_dir.name}_analysis_{max_width}w_{fps}fps.mp4"
+    timeline_payload = [
+        {
+            "start": str(row.get("start", "")),
+            "end": str(row.get("end", "")),
+        }
+        for row in (shots or [])
+    ]
+    timeline_hash = hashlib.sha1(
+        json.dumps(timeline_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:10] if timeline_payload else "plain"
+    output_path = analysis_dir / f"{project_dir.name}_analysis_{max_width}w_{fps}fps_{timeline_hash}.mp4"
     if output_path.exists() and output_path.stat().st_mtime >= video_path.stat().st_mtime:
         return output_path
 
     ffmpeg = _require_binary("ffmpeg")
+    filters = [f"scale='min({max_width},iw)':-2"]
+    if shots:
+        labels_path = analysis_dir / f"shot_labels_{timeline_hash}.ass"
+        write_analysis_labels(labels_path, shots, max_width)
+        filters.append(f"subtitles='{ffmpeg_filter_path(labels_path)}'")
+
     result = _run(
         [
             ffmpeg,
@@ -1257,7 +1761,7 @@ def prepare_analysis_video(project_dir: Path, max_width: int = 640, fps: int = 8
             "-map",
             "0:a?",
             "-vf",
-            f"scale='min({max_width},iw)':-2",
+            ",".join(filters),
             "-r",
             str(fps),
             "-c:v",
@@ -2078,6 +2582,10 @@ class FilmStudyRequestHandler(BaseHTTPRequestHandler):
                 project_id = path.removeprefix("/api/projects/").removesuffix("/generate-details").strip("/")
                 payload = self.read_json()
                 self.send_json(update_shots_with_llm_details(self.config.outputs_dir, project_id, payload))
+            elif path.startswith("/api/projects/") and path.endswith("/suggest-shot-boundaries"):
+                project_id = path.removeprefix("/api/projects/").removesuffix("/suggest-shot-boundaries").strip("/")
+                payload = self.read_json()
+                self.send_json(ai_shot_boundary_suggestions(self.config.outputs_dir, project_id, payload))
             elif path.startswith("/api/projects/") and path.endswith("/frame"):
                 project_id = path.removeprefix("/api/projects/").removesuffix("/frame").strip("/")
                 payload = self.read_json()

@@ -29,6 +29,8 @@ const state = {
   hiddenFolders: new Set(),
   fullVideoOpen: false,
   dirty: false,
+  detailResolutionResolver: null,
+  shotSuggestions: [],
 };
 
 const DEFAULT_QWEN_VIDEO_MODEL = "qwen3.7-plus";
@@ -87,6 +89,17 @@ const els = {
   filmContextField: document.querySelector("#filmContextField"),
   modelField: document.querySelector("#modelField"),
   generateDetails: document.querySelector("#generateDetails"),
+  detailResolution: document.querySelector("#detailResolution"),
+  detailResolutionTitle: document.querySelector("#detailResolutionTitle"),
+  detailResolutionSummary: document.querySelector("#detailResolutionSummary"),
+  detailResolutionOptions: document.querySelector("#detailResolutionOptions"),
+  cancelDetailResolution: document.querySelector("#cancelDetailResolution"),
+  shotReview: document.querySelector("#shotReview"),
+  shotReviewSummary: document.querySelector("#shotReviewSummary"),
+  shotReviewList: document.querySelector("#shotReviewList"),
+  closeShotReview: document.querySelector("#closeShotReview"),
+  cancelShotReview: document.querySelector("#cancelShotReview"),
+  applyShotSuggestions: document.querySelector("#applyShotSuggestions"),
   detailView: document.querySelector("#detailView"),
   closeDetail: document.querySelector("#closeDetail"),
   prevShot: document.querySelector("#prevShot"),
@@ -188,6 +201,55 @@ function markManualField(shot, field) {
   if (!shot) return;
   if (!Array.isArray(shot.manual_fields)) shot.manual_fields = [];
   if (!shot.manual_fields.includes(field)) shot.manual_fields.push(field);
+}
+
+const DETAIL_FIELDS = [
+  "shot_title",
+  "visual_description",
+  "audio_dialogue",
+  "action_camera",
+  "camera_movement_type",
+  "camera_movement_intensity",
+  "camera_movement_confidence",
+  "camera_movement_evidence",
+  "narrative_function",
+  "notes",
+];
+
+function blankGeneratedDetails(shot, title = "Title Pending") {
+  shot.shot_title = title;
+  shot.visual_description = "";
+  shot.audio_dialogue = "";
+  shot.action_camera = "";
+  shot.camera_movement_type = "";
+  shot.camera_movement_intensity = "";
+  shot.camera_movement_confidence = "";
+  shot.camera_movement_evidence = "";
+  shot.narrative_function = "";
+  shot.notes = "";
+  shot.manual_fields = [];
+  shot.analysis_stale = true;
+}
+
+function copyDetailFields(target, source) {
+  for (const field of DETAIL_FIELDS) {
+    target[field] = source[field] ?? "";
+  }
+  target.manual_fields = Array.isArray(source.manual_fields) ? [...source.manual_fields] : [];
+  target.analysis_stale = false;
+}
+
+function applyAiSplitDetails(target, details) {
+  blankGeneratedDetails(target, "Title Pending");
+  if (!details || typeof details !== "object") return;
+  for (const field of DETAIL_FIELDS) {
+    const value = details[field];
+    if (typeof value === "string" && value.trim()) {
+      target[field] = value.trim();
+    }
+  }
+  target.manual_fields = [];
+  target.analysis_stale = !details.shot_title;
 }
 
 function memberLabel(shot) {
@@ -1742,6 +1804,67 @@ function splitShotTitle(baseTitle, suffix) {
   return `${cleaned} ${suffix}`;
 }
 
+function splitDetailResolution(shot) {
+  return requestDetailResolution({
+    title: "Split shot details",
+    summary: `Shot #${shot.shot} is becoming two shots. Choose where the current title and descriptions should stay; the blank half can be regenerated cleanly.`,
+    options: [
+      {
+        value: "first",
+        label: "Keep on first half",
+        description: "Best when the existing description mostly belongs before the cut. The second half will be blank for new generation.",
+      },
+      {
+        value: "second",
+        label: "Keep on second half",
+        description: "Use this when the existing description mostly belongs after the cut.",
+      },
+      {
+        value: "both",
+        label: "Copy to both halves",
+        description: "Useful for a split inside one continuous action, but both halves may need cleanup.",
+      },
+      {
+        value: "blank",
+        label: "Blank both halves",
+        description: "Use when the old generated details are offset or unreliable.",
+      },
+    ],
+  });
+}
+
+function requestDetailResolution({ title, summary, options }) {
+  closeDetailResolution(null);
+  els.detailResolutionTitle.textContent = title;
+  els.detailResolutionSummary.textContent = summary;
+  els.detailResolutionOptions.innerHTML = "";
+  for (const option of options) {
+    const button = document.createElement("button");
+    button.className = "detail-resolution-option";
+    button.type = "button";
+    button.innerHTML = `<strong></strong><span></span>`;
+    button.querySelector("strong").textContent = option.label;
+    button.querySelector("span").textContent = option.description;
+    button.addEventListener("click", () => closeDetailResolution(option.value), { once: true });
+    els.detailResolutionOptions.append(button);
+  }
+  els.detailResolution.hidden = false;
+  return new Promise((resolve) => {
+    state.detailResolutionResolver = resolve;
+  });
+}
+
+function closeDetailResolution(value = null) {
+  if (!els.detailResolution) return;
+  els.detailResolution.hidden = true;
+  els.detailResolutionOptions.innerHTML = "";
+  if (state.detailResolutionResolver) {
+    const resolve = state.detailResolutionResolver;
+    state.detailResolutionResolver = null;
+    resolve(value);
+  }
+}
+
 async function applyScreencap() {
   if (!state.screencapMode || state.screencapIndex == null || !state.project) return;
   const index = state.screencapIndex;
@@ -1772,48 +1895,71 @@ async function applyScreencap() {
   }
 }
 
+async function splitShotAt(index, cut, resolution = "blank", labelPrefix = "split", splitDetails = null) {
+  const shot = state.shots[index];
+  if (!shot || !state.project) throw new Error("Shot is no longer available");
+  const bounds = splitBounds(shot);
+  const safeCut = clamp(Number(cut), bounds.min, bounds.max);
+  const firstMidpoint = (bounds.start + safeCut) / 2;
+  const secondMidpoint = (safeCut + bounds.end) / 2;
+  const [firstFrame, secondFrame] = await Promise.all([
+    captureSplitFrame(state.project.id, firstMidpoint, `${labelPrefix}_${shot.shot}_a`),
+    captureSplitFrame(state.project.id, secondMidpoint, `${labelPrefix}_${shot.shot}_b`),
+  ]);
+  const baseTitle = shotTitle(shot);
+  const splitNote = `Split from shot #${shot.shot} at ${formatStartTime(secondsToTimestamp(safeCut))}.`;
+  const firstShot = {
+    ...shot,
+    ...firstFrame,
+    end: secondsToTimestamp(safeCut),
+    duration_seconds: Number((safeCut - bounds.start).toFixed(3)),
+  };
+  const secondShot = {
+    ...shot,
+    ...secondFrame,
+    start: secondsToTimestamp(safeCut),
+    duration_seconds: Number((bounds.end - safeCut).toFixed(3)),
+  };
+  if (resolution === "ai") {
+    applyAiSplitDetails(firstShot, splitDetails?.before);
+  } else if (resolution === "first" || resolution === "both") {
+    copyDetailFields(firstShot, shot);
+    firstShot.shot_title = splitShotTitle(baseTitle, "A");
+    firstShot.notes = firstShot.notes ? `${firstShot.notes}\n\n${splitNote}` : splitNote;
+  } else {
+    blankGeneratedDetails(firstShot, "Title Pending");
+  }
+  if (resolution === "ai") {
+    applyAiSplitDetails(secondShot, splitDetails?.after);
+  } else if (resolution === "second" || resolution === "both") {
+    copyDetailFields(secondShot, shot);
+    secondShot.shot_title = splitShotTitle(baseTitle, "B");
+    secondShot.notes = secondShot.notes ? `${secondShot.notes}\n\n${splitNote}` : splitNote;
+  } else {
+    blankGeneratedDetails(secondShot, "Title Pending");
+  }
+  state.shots.splice(index, 1, firstShot, secondShot);
+  state.shots.forEach((item, itemIndex) => {
+    item.shot = itemIndex + 1;
+  });
+  updateOutlineAfterSplit(shot.shot);
+  return safeCut;
+}
+
 async function applySplit() {
   if (!state.splitMode || state.splitIndex == null || !state.project) return;
   const index = state.splitIndex;
   const shot = state.shots[index];
+  const resolution = await splitDetailResolution(shot);
+  if (!resolution) return;
   const bounds = splitBounds(shot);
   const cut = clamp(Number(els.splitSlider.value), bounds.min, bounds.max);
-  const firstMidpoint = (bounds.start + cut) / 2;
-  const secondMidpoint = (cut + bounds.end) / 2;
   els.applySplit.disabled = true;
   setStatus(`Splitting shot #${shot.shot}...`);
 
   try {
-    const [firstFrame, secondFrame] = await Promise.all([
-      captureSplitFrame(state.project.id, firstMidpoint, `split_${shot.shot}_a`),
-      captureSplitFrame(state.project.id, secondMidpoint, `split_${shot.shot}_b`),
-    ]);
     rememberUndo("shot split");
-    const baseTitle = shotTitle(shot);
-    const splitNote = `Split from shot #${shot.shot} at ${formatStartTime(secondsToTimestamp(cut))}.`;
-    const firstShot = {
-      ...shot,
-      ...firstFrame,
-      shot_title: splitShotTitle(baseTitle, "A"),
-      end: secondsToTimestamp(cut),
-      duration_seconds: Number((cut - bounds.start).toFixed(3)),
-      notes: shot.notes ? `${shot.notes}\n\n${splitNote}` : splitNote,
-      analysis_stale: true,
-    };
-    const secondShot = {
-      ...shot,
-      ...secondFrame,
-      shot_title: splitShotTitle(baseTitle, "B"),
-      start: secondsToTimestamp(cut),
-      duration_seconds: Number((bounds.end - cut).toFixed(3)),
-      notes: shot.notes ? `${shot.notes}\n\n${splitNote}` : splitNote,
-      analysis_stale: true,
-    };
-    state.shots.splice(index, 1, firstShot, secondShot);
-    state.shots.forEach((item, itemIndex) => {
-      item.shot = itemIndex + 1;
-    });
-    updateOutlineAfterSplit(shot.shot);
+    await splitShotAt(index, cut, resolution, `split_${Date.now()}`);
     clearSelection();
     state.activeIndex = index;
     state.splitMode = false;
@@ -1996,28 +2142,42 @@ function markDirty(message) {
   setStatus(message);
 }
 
-function combineRange(indices) {
+async function combineRange(indices) {
   const selected = [...indices].sort((a, b) => a - b);
   if (!selected.length) return;
-  rememberUndo("shot combine");
   const firstIndex = selected[0];
   const lastIndex = selected[selected.length - 1];
   const range = state.shots.slice(firstIndex, lastIndex + 1);
+  const resolution = await askCombineDetailResolution(range);
+  if (!resolution) return;
+  rememberUndo("shot combine");
   const members = range.flatMap((shot) => Array.isArray(shot.members) ? shot.members : [shot.originalShot ?? shot.shot]);
   const first = range[0];
   const last = range[range.length - 1];
   const combined = {
     ...first,
     members,
-    shot_title: makeCombinedTitle(range),
     end: last.end,
     duration_seconds: Number((timeToSeconds(last.end) - timeToSeconds(first.start)).toFixed(3)),
-    notes: makeCombinedNotes(range),
-    audio_dialogue: makeCombinedAudio(range),
-    action_camera: makeCombinedAction(range),
-    narrative_function: makeCombinedNarrative(range),
-    analysis_stale: true,
   };
+  if (resolution.mode === "source" && resolution.source) {
+    copyDetailFields(combined, resolution.source);
+  } else if (resolution.mode === "merge") {
+    combined.shot_title = makeCombinedTitle(range);
+    combined.visual_description = makeCombinedVisual(range);
+    combined.notes = makeCombinedNotes(range);
+    combined.audio_dialogue = makeCombinedAudio(range);
+    combined.action_camera = makeCombinedAction(range);
+    combined.camera_movement_type = "";
+    combined.camera_movement_intensity = "";
+    combined.camera_movement_confidence = "";
+    combined.camera_movement_evidence = "";
+    combined.narrative_function = makeCombinedNarrative(range);
+    combined.manual_fields = [];
+    combined.analysis_stale = true;
+  } else {
+    blankGeneratedDetails(combined, "Title Pending");
+  }
   state.shots.splice(firstIndex, range.length, combined);
   state.shots.forEach((shot, index) => {
     shot.shot = index + 1;
@@ -2102,6 +2262,10 @@ function makeCombinedTitle(range) {
   return `${shotTitle(first)} / ${shotTitle(last)}`;
 }
 
+function makeCombinedVisual(range) {
+  return range.map((shot) => shot.visual_description).filter(Boolean).join("\n\n");
+}
+
 function makeCombinedAction(range) {
   const actions = range.map((shot) => shot.action_camera).filter(Boolean);
   return actions.join("\n\n");
@@ -2115,6 +2279,51 @@ function makeCombinedAudio(range) {
 function makeCombinedNarrative(range) {
   const beats = range.map((shot) => shot.narrative_function).filter(Boolean);
   return beats.join("\n\n");
+}
+
+async function askCombineDetailResolution(range) {
+  const choice = await requestDetailResolution({
+    title: "Combine shot details",
+    summary: `${range.length} shots are becoming one shot. Choose whether to keep an existing description, merge the selected text temporarily, or blank the combined shot for new generation.`,
+    options: [
+      {
+        value: "blank",
+        label: "Blank for new generation",
+        description: "Best when details are offset or the combined shot should be analyzed fresh.",
+      },
+      {
+        value: "merge",
+        label: "Merge selected text",
+        description: "Keeps a temporary combined title, notes, dialogue, action, and narrative text.",
+      },
+      {
+        value: "source:first",
+        label: `Keep first: #${range[0].shot}`,
+        description: shotTitle(range[0]),
+      },
+      {
+        value: "source:last",
+        label: `Keep last: #${range[range.length - 1].shot}`,
+        description: shotTitle(range[range.length - 1]),
+      },
+      ...range.slice(1, -1).map((shot, index) => ({
+        value: `source:middle:${index + 1}`,
+        label: `Keep #${shot.shot}`,
+        description: shotTitle(shot),
+      })),
+    ],
+  });
+  if (!choice) return null;
+  if (choice === "blank") return { mode: "blank" };
+  if (choice === "merge") return { mode: "merge" };
+  if (choice === "source:first") return { mode: "source", source: range[0] };
+  if (choice === "source:last") return { mode: "source", source: range[range.length - 1] };
+  if (choice.startsWith("source:middle:")) {
+    const offset = Number(choice.split(":").at(-1));
+    const source = range.slice(1, -1)[offset - 1];
+    if (source) return { mode: "source", source };
+  }
+  return null;
 }
 
 function timeToSeconds(value) {
@@ -2138,6 +2347,114 @@ async function saveCorrections() {
   await refreshProjectList();
 }
 
+function closeShotReview() {
+  state.shotSuggestions = [];
+  els.shotReview.hidden = true;
+  els.shotReviewList.replaceChildren();
+}
+
+function renderShotReview(result) {
+  state.shotSuggestions = Array.isArray(result.suggestions) ? result.suggestions : [];
+  els.shotReviewList.replaceChildren();
+  els.shotReviewSummary.textContent = state.shotSuggestions.length
+    ? `${state.shotSuggestions.length} possible missing ${state.shotSuggestions.length === 1 ? "cut" : "cuts"} found. High-confidence suggestions are selected.`
+    : "The AI pass did not find any missing cuts in the current timeline.";
+
+  if (!state.shotSuggestions.length) {
+    const empty = document.createElement("div");
+    empty.className = "shot-review-empty";
+    empty.textContent = "No timeline changes suggested.";
+    els.shotReviewList.append(empty);
+  }
+
+  state.shotSuggestions.forEach((suggestion, index) => {
+    const row = document.createElement("label");
+    row.className = "shot-suggestion";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.dataset.suggestionIndex = String(index);
+    checkbox.checked = suggestion.confidence === "high";
+
+    const frames = document.createElement("div");
+    frames.className = "shot-suggestion-frames";
+    for (const [url, side] of [
+      [suggestion.beforeFrameUrl, "before"],
+      [suggestion.afterFrameUrl, "after"],
+    ]) {
+      const image = document.createElement("img");
+      image.src = url;
+      image.alt = `${side} proposed cut at ${formatStartTime(secondsToTimestamp(suggestion.time_seconds))}`;
+      frames.append(image);
+    }
+
+    const copy = document.createElement("div");
+    copy.className = "shot-suggestion-copy";
+    const title = document.createElement("strong");
+    title.textContent = `Split shot #${suggestion.sourceShot} at ${formatStartTime(secondsToTimestamp(suggestion.time_seconds))}`;
+    const meta = document.createElement("span");
+    meta.className = "shot-suggestion-meta";
+    meta.textContent = `${suggestion.transition_type || "cut"} - ${suggestion.confidence || "medium"} confidence`;
+    const reason = document.createElement("p");
+    reason.textContent = suggestion.reason || `${suggestion.from_visual || "Earlier image"} changes to ${suggestion.to_visual || "a new image"}.`;
+    copy.append(title, meta, reason);
+    row.append(checkbox, frames, copy);
+    els.shotReviewList.append(row);
+  });
+  els.applyShotSuggestions.disabled = !state.shotSuggestions.length;
+  els.shotReview.hidden = false;
+}
+
+async function applySelectedShotSuggestions() {
+  const selected = [...els.shotReviewList.querySelectorAll('input[type="checkbox"]:checked')]
+    .map((checkbox) => state.shotSuggestions[Number(checkbox.dataset.suggestionIndex)])
+    .filter(Boolean)
+    .sort((a, b) => Number(a.time_seconds) - Number(b.time_seconds));
+  if (!selected.length) {
+    setStatus("Select at least one suggested cut.");
+    return;
+  }
+  els.applyShotSuggestions.disabled = true;
+  const projectId = state.project.id;
+  closeShotReview();
+  rememberUndo("AI shot refinement");
+  setStatus(`Applying ${selected.length} selected ${selected.length === 1 ? "cut" : "cuts"}...`);
+  try {
+    for (let suggestionIndex = 0; suggestionIndex < selected.length; suggestionIndex += 1) {
+      const cut = Number(selected[suggestionIndex].time_seconds);
+      const shotIndex = state.shots.findIndex((shot) => {
+        const start = timeToSeconds(shot.start);
+        const end = timeToSeconds(shot.end);
+        return start + 0.25 < cut && cut < end - 0.25;
+      });
+      if (shotIndex < 0) continue;
+      await splitShotAt(
+        shotIndex,
+        cut,
+        "ai",
+        `ai_${Date.now()}_${suggestionIndex + 1}`,
+        {
+          before: selected[suggestionIndex].before_details,
+          after: selected[suggestionIndex].after_details,
+        },
+      );
+    }
+    clearSelection();
+    state.activeIndex = null;
+    markDirty("AI cut refinements applied. Saving the updated timeline and captions...");
+    render();
+    await saveCorrections();
+    await loadProject(projectId);
+    setStatus("AI cut refinements and their shot details were saved from the same analysis pass.");
+  } catch (error) {
+    console.error(error);
+    markDirty("Some AI cut refinements could not be completed. Undo is available.");
+    render();
+    setStatus(readErrorMessage(error, "Could not apply every selected cut."));
+  } finally {
+    els.applyShotSuggestions.disabled = false;
+  }
+}
+
 async function generateShotDetails() {
   if (!state.project || !state.shots.length) return;
   saveDetailFields();
@@ -2148,7 +2465,7 @@ async function generateShotDetails() {
   saveLlmSettings();
   els.generateDetails.disabled = true;
   els.saveButton.disabled = true;
-  setStatus("Generating shot details from the native video...");
+  setStatus("Generating shot details and checking the timeline for missed cuts...");
   try {
     const result = await fetchJson(`/api/projects/${encodeURIComponent(state.project.id)}/generate-details`, {
       method: "POST",
@@ -2169,7 +2486,12 @@ async function generateShotDetails() {
       state.activeIndex = Math.min(state.activeIndex, state.shots.length - 1);
       syncDetailFields();
     }
-    setStatus(`Generated details for ${result.shotCount} shots with ${result.provider || "video analysis"}. Corrected spreadsheet rebuilt.`);
+    if (result.suggestionCount) {
+      renderShotReview(result);
+      setStatus(`Generated ${result.shotCount} shot details and found ${result.suggestionCount} possible missing ${result.suggestionCount === 1 ? "cut" : "cuts"}. Review before applying.`);
+    } else {
+      setStatus(`Generated details for ${result.shotCount} shots and checked the cuts with ${result.provider || "video analysis"}. Corrected spreadsheet rebuilt.`);
+    }
     await refreshProjectList();
   } catch (error) {
     console.error(error);
@@ -2369,6 +2691,16 @@ els.saveButton.addEventListener("click", saveCorrections);
 els.generateDetails.addEventListener("click", generateShotDetails);
 els.modelField.addEventListener("change", saveLlmSettings);
 els.filmContextField.addEventListener("input", scheduleContextSave);
+els.cancelDetailResolution.addEventListener("click", () => closeDetailResolution(null));
+els.detailResolution.addEventListener("click", (event) => {
+  if (event.target === els.detailResolution) closeDetailResolution(null);
+});
+els.closeShotReview.addEventListener("click", closeShotReview);
+els.cancelShotReview.addEventListener("click", closeShotReview);
+els.applyShotSuggestions.addEventListener("click", applySelectedShotSuggestions);
+els.shotReview.addEventListener("click", (event) => {
+  if (event.target === els.shotReview) closeShotReview();
+});
 els.closeSentencePopover.addEventListener("click", () => closeSentencePopover());
 els.sentencePopover.addEventListener("click", (event) => event.stopPropagation());
 els.sentenceTitleField.addEventListener("input", updateActiveSentenceFromPopover);
@@ -2432,6 +2764,14 @@ for (const field of [els.titleField, els.notesField, els.visualField, els.audioF
 }
 
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !els.shotReview.hidden) {
+    closeShotReview();
+    return;
+  }
+  if (event.key === "Escape" && !els.detailResolution.hidden) {
+    closeDetailResolution(null);
+    return;
+  }
   if (event.key === "Escape" && !els.sentencePopover.hidden) {
     closeSentencePopover();
     return;

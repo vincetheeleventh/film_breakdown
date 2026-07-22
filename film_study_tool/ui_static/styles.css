@@ -1245,6 +1245,232 @@ button:hover:not(:disabled) {
   gap: 8px;
 }
 
+.detail-resolution {
+  position: fixed;
+  inset: 0;
+  z-index: 42;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(4, 7, 12, 0.72);
+  backdrop-filter: blur(10px);
+}
+
+.detail-resolution-card {
+  width: min(560px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: #111925;
+  box-shadow: var(--shadow);
+}
+
+.detail-resolution-header {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.detail-resolution-header strong {
+  display: block;
+  margin-bottom: 6px;
+  color: #f4f8fc;
+  font-size: 18px;
+}
+
+.detail-resolution-header p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.detail-resolution-header .icon-button {
+  position: static;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+}
+
+.detail-resolution-options {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.detail-resolution-option {
+  display: grid;
+  gap: 4px;
+  min-height: 0;
+  padding: 12px;
+  text-align: left;
+  border-color: rgba(255, 255, 255, 0.12);
+  background: #151f2d;
+}
+
+.detail-resolution-option strong {
+  color: #edf5fb;
+  font-size: 14px;
+}
+
+.detail-resolution-option span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: normal;
+}
+
+.shot-review {
+  position: fixed;
+  inset: 0;
+  z-index: 44;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(4, 7, 12, 0.78);
+  backdrop-filter: blur(10px);
+}
+
+.shot-review[hidden] {
+  display: none;
+}
+
+.shot-review-card {
+  width: min(860px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 8px;
+  background: #101822;
+  box-shadow: var(--shadow);
+}
+
+.shot-review-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 18px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.shot-review-header strong {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--ink);
+  font-size: 18px;
+}
+
+.shot-review-header p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.shot-review-header .icon-button {
+  position: static;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+}
+
+.shot-review-list {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.shot-suggestion {
+  display: grid;
+  grid-template-columns: auto minmax(240px, 0.9fr) minmax(280px, 1.1fr);
+  gap: 12px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 7px;
+  background: #151f2b;
+}
+
+.shot-suggestion > input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+.shot-suggestion-frames {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  overflow: hidden;
+  border-radius: 5px;
+  background: #070b10;
+}
+
+.shot-suggestion-frames img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+}
+
+.shot-suggestion-copy {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.shot-suggestion-copy strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.shot-suggestion-meta {
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 750;
+  text-transform: capitalize;
+}
+
+.shot-suggestion-copy p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.shot-review-empty {
+  padding: 28px 18px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.shot-review-actions {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(16, 24, 34, 0.96);
+}
+
+@media (max-width: 720px) {
+  .shot-suggestion {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .shot-suggestion-frames {
+    grid-column: 2;
+  }
+}
+
 .detail-view {
   position: fixed;
   inset: 0;

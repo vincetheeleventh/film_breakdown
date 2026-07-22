@@ -8,6 +8,7 @@ Use the user's study notes as hypotheses, not as facts. Validate them when the s
 
 Columns to produce:
 
+- analysis_id: Copy this exactly from the input row. This is how the app attaches your analysis to the correct current shot after user edits.
 - shot_title: A short card title, 1 to 7 words. Do not include the shot number. Use concrete story/place/action language, for example "EXT Hospital, Rainy" or "Carl Offers His Hand."
 - visual_description: What is visibly depicted, including shot size/type, characters, setting, composition, important props, blocking, color/light, and readable visual motifs.
 - audio_dialogue: Dialogue, voiceover, music cues, sound effects, or "No clear dialogue/audio available from the attached video/captions" when the video and existing transcript/caption evidence cannot establish audio. Preserve existing caption/transcript text when it is already present in the shot list.
@@ -32,6 +33,7 @@ Return only valid JSON in this shape:
 {
   "shots": [
     {
+      "analysis_id": "row_0001",
       "shot": 1,
       "shot_title": "...",
       "visual_description": "...",
@@ -44,5 +46,48 @@ Return only valid JSON in this shape:
       "narrative_function": "...",
       "notes": "..."
     }
+  ],
+  "transitions": [
+    {
+      "time_seconds": 12.34,
+      "transition_type": "hard_cut | dissolve | crossfade | fade | wipe | other",
+      "confidence": "high | medium | low",
+      "from_visual": "...",
+      "to_visual": "...",
+      "reason": "...",
+      "transition_start_seconds": 12.1,
+      "transition_end_seconds": 12.6,
+      "before_details": {
+        "shot_title": "...",
+        "visual_description": "...",
+        "audio_dialogue": "...",
+        "action_camera": "...",
+        "camera_movement_type": "...",
+        "camera_movement_intensity": "...",
+        "camera_movement_confidence": "...",
+        "camera_movement_evidence": "...",
+        "narrative_function": "...",
+        "notes": "..."
+      },
+      "after_details": {
+        "shot_title": "...",
+        "visual_description": "...",
+        "audio_dialogue": "...",
+        "action_camera": "...",
+        "camera_movement_type": "...",
+        "camera_movement_intensity": "...",
+        "camera_movement_confidence": "...",
+        "camera_movement_evidence": "...",
+        "narrative_function": "...",
+        "notes": "..."
+      }
+    }
   ]
 }
+
+The transitions array is the independent shot-identification pass performed during the same viewing. Include real
+transitions already represented by the supplied timeline as well as missing ones. Do not mistake camera movement,
+subject movement, animation within a composition, or lighting changes for a cut. The app filters existing boundaries
+and shows only possible missing cuts to the user. For a transition missing from the current timeline, include
+before_details and after_details so the split can be applied without another model request. Omit those detail objects
+for transitions already represented by a current boundary.

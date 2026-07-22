@@ -8,7 +8,7 @@
     <link rel="icon" href="/static/icons/wheel-favicon.png" type="image/png">
     <link rel="apple-touch-icon" href="/static/icons/wheel-192.png">
     <link rel="manifest" href="/static/manifest.webmanifest?v=20260713-wheel">
-    <link rel="stylesheet" href="/static/styles.css?v=20260713-full-video">
+    <link rel="stylesheet" href="/static/styles.css?v=20260722-unified-analysis">
   </head>
   <body>
     <main class="app-shell">
@@ -144,6 +144,36 @@
       </div>
     </section>
 
+    <section id="detailResolution" class="detail-resolution" aria-modal="true" role="dialog" hidden>
+      <div class="detail-resolution-card">
+        <div class="detail-resolution-header">
+          <div>
+            <strong id="detailResolutionTitle">Resolve shot details</strong>
+            <p id="detailResolutionSummary"></p>
+          </div>
+          <button id="cancelDetailResolution" class="icon-button" type="button" aria-label="Cancel detail choice">X</button>
+        </div>
+        <div id="detailResolutionOptions" class="detail-resolution-options"></div>
+      </div>
+    </section>
+
+    <section id="shotReview" class="shot-review" aria-modal="true" role="dialog" hidden>
+      <div class="shot-review-card">
+        <div class="shot-review-header">
+          <div>
+            <strong>Review Missing Cuts</strong>
+            <p id="shotReviewSummary"></p>
+          </div>
+          <button id="closeShotReview" class="icon-button" type="button" aria-label="Close cut review">X</button>
+        </div>
+        <div id="shotReviewList" class="shot-review-list"></div>
+        <div class="shot-review-actions">
+          <button id="cancelShotReview" type="button">Cancel</button>
+          <button id="applyShotSuggestions" class="primary-button" type="button">Apply Selected Cuts</button>
+        </div>
+      </div>
+    </section>
+
     <section id="detailView" class="detail-view" aria-modal="true" role="dialog" hidden>
       <div class="detail-stage">
         <button id="closeDetail" class="icon-button close-button" type="button" aria-label="Close detail view">X</button>
@@ -213,6 +243,6 @@
       </div>
     </section>
 
-    <script src="/static/app.js?v=20260713-full-video" type="module"></script>
+    <script src="/static/app.js?v=20260722-unified-analysis" type="module"></script>
   </body>
 </html>
