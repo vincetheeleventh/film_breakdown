@@ -42,7 +42,7 @@ GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/inte
 GEMINI_FILES_UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 GEMINI_FILE_GET_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_INLINE_VIDEO_LIMIT_BYTES = 20 * 1024 * 1024
-DEFAULT_QWEN_VIDEO_MODEL = "qwen3.7-plus"
+DEFAULT_QWEN_VIDEO_MODEL = "qwen3.5-omni-plus"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 OUTLINE_FILENAME = "outline.json"
 OUTLINE_CSV_FILENAME = "outline.csv"
@@ -50,6 +50,10 @@ STUDY_CONTEXT_FILENAME = "study_context.txt"
 LAST_LLM_RESPONSE_FILENAME = "last_llm_response.json"
 LAST_LLM_ERROR_FILENAME = "last_llm_error.json"
 PROJECT_META_FILENAME = "project_meta.json"
+ANALYSIS_SESSION_FILENAME = "analysis_session.json"
+# Alibaba caps the encoded Base64 string at 10 MB, so keep the binary safely below that.
+QWEN_BASE64_VIDEO_LIMIT_BYTES = 7 * 1024 * 1024
+QWEN_ANALYSIS_SEGMENT_SECONDS = 90.0
 AI_SHOT_DETECTION_INSTRUCTIONS = """You are a meticulous film editor reviewing shot boundaries.
 Watch the complete attached video. Identify every visual transition between distinct shots, including hard cuts,
 dissolves, crossfades, fades, wipes, and transitions hidden by camera or subject motion. The visible SHOT label
@@ -209,6 +213,99 @@ def save_project_meta(project_dir: Path, meta: dict[str, object]) -> dict[str, o
     cleaned["groupPath"] = normalize_group_path(cleaned.get("groupPath", []))
     project_meta_path(project_dir).write_text(json.dumps(cleaned, indent=2), encoding="utf-8")
     return cleaned
+
+
+def analysis_session_path(project_dir: Path) -> Path:
+    return project_dir / ANALYSIS_SESSION_FILENAME
+
+
+def load_analysis_session(project_dir: Path) -> dict[str, object]:
+    path = analysis_session_path(project_dir)
+    if not path.exists():
+        return {}
+    try:
+        session = load_json(path)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return session if isinstance(session, dict) else {}
+
+
+def save_analysis_session(project_dir: Path, session: dict[str, object]) -> dict[str, object]:
+    cleaned = dict(session)
+    analysis_session_path(project_dir).write_text(json.dumps(cleaned, indent=2), encoding="utf-8")
+    return cleaned
+
+
+def timeline_analysis_id(row: dict[str, object], index: int = 0) -> str:
+    try:
+        start_ms = round(_seconds_from_timestamp(str(row.get("start", ""))) * 1000)
+        end_ms = round(_seconds_from_timestamp(str(row.get("end", ""))) * 1000)
+    except (TypeError, ValueError):
+        start_ms = index
+        end_ms = index + 1
+    digest = hashlib.sha1(f"{start_ms}:{end_ms}".encode("ascii")).hexdigest()[:12]
+    return f"shot_{start_ms}_{end_ms}_{digest}"
+
+
+def timeline_revision(shots: list[dict[str, object]]) -> str:
+    identities = [timeline_analysis_id(row, index) for index, row in enumerate(shots)]
+    return hashlib.sha256(json.dumps(identities).encode("utf-8")).hexdigest()[:16]
+
+
+def source_video_fingerprint(video_path: Path) -> str:
+    stat = video_path.stat()
+    payload = f"{video_path.name}:{stat.st_size}:{stat.st_mtime_ns}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+
+
+def shot_requires_analysis(
+    row: dict[str, object],
+    index: int,
+    session: dict[str, object],
+) -> bool:
+    if bool(row.get("analysis_stale")):
+        return True
+    analyzed = session.get("analyzedShots")
+    if not isinstance(analyzed, dict):
+        return True
+    analysis_id = timeline_analysis_id(row, index)
+    if analysis_id not in analyzed:
+        return True
+    required_fields = ["shot_title", "visual_description", "action_camera", "narrative_function"]
+    return any(
+        not is_manual_field(row, field)
+        and is_placeholder_field_value(field, str(row.get(field, "")), index)
+        for field in required_fields
+    )
+
+
+def analysis_session_summary(
+    project_dir: Path,
+    shots: list[dict[str, object]],
+) -> dict[str, object]:
+    session = load_analysis_session(project_dir)
+    current_context_hash = hashlib.sha256(
+        load_study_context(project_dir).strip().encode("utf-8")
+    ).hexdigest()[:16]
+    changed = [
+        timeline_analysis_id(row, index)
+        for index, row in enumerate(shots)
+        if shot_requires_analysis(row, index, session)
+    ]
+    return {
+        "hasFullAnalysis": bool(session.get("hasFullAnalysis")),
+        "provider": str(session.get("provider") or ""),
+        "model": str(session.get("model") or ""),
+        "firstAnalyzedAt": session.get("firstAnalyzedAt"),
+        "updatedAt": session.get("updatedAt"),
+        "analysisRevision": safe_int(session.get("analysisRevision"), 0),
+        "timelineRevision": str(session.get("timelineRevision") or ""),
+        "currentTimelineRevision": timeline_revision(shots),
+        "changedShotCount": len(changed),
+        "contextChanged": bool(session.get("hasFullAnalysis"))
+        and str(session.get("userContextHash") or "") != current_context_hash,
+        "filmMemory": session.get("filmMemory") if isinstance(session.get("filmMemory"), dict) else {},
+    }
 
 
 def normalize_cover_crop(value: object) -> dict[str, float]:
@@ -435,6 +532,7 @@ def normalize_shot_row(row: dict[str, object], index: int, project_dir: Path) ->
     shot_title = str(row.get("shot_title") or row.get("title") or _default_shot_title(row, index))
     return {
         "shot": index + 1,
+        "analysis_id": timeline_analysis_id(row, index),
         "originalShot": row.get("originalShot", row.get("shot", index + 1)),
         "members": row.get("members", [row.get("shot", index + 1)]),
         "shot_title": shot_title,
@@ -802,6 +900,7 @@ def load_project(outputs_dir: Path, project_id: str) -> dict[str, object]:
         "captionShotsUpdated": meta.get("captionShotsUpdated", 0),
         "videoUrl": f"/video/{project_dir.name}" if video_path else None,
         "hasCorrections": manifest_path.name == "corrected_manifest.json",
+        "analysisSession": analysis_session_summary(project_dir, normalized),
         "paths": {
             "manifest": str(manifest_path),
             "correctedManifest": str(project_dir / "corrected_manifest.json"),
@@ -826,6 +925,7 @@ def save_corrected_project(outputs_dir: Path, project_id: str, payload: dict[str
         corrected_rows.append(
             {
                 "shot": index + 1,
+                "analysis_id": normalized["analysis_id"],
                 "originalShot": normalized["originalShot"],
                 "members": normalized["members"],
                 "shot_title": normalized["shot_title"],
@@ -894,10 +994,42 @@ def save_corrected_project(outputs_dir: Path, project_id: str, payload: dict[str
         "shotCount": len(corrected_rows),
         "outline": outline,
         "userContext": user_context,
+        "analysisSession": analysis_session_summary(project_dir, corrected_rows),
         "correctedManifest": str(corrected_manifest),
         "correctedCsv": str(corrected_csv),
         "correctedWorkbook": str(corrected_workbook),
     }
+
+
+def analysis_target_ids(
+    shots: list[dict[str, object]],
+    session: dict[str, object],
+    force_all: bool = False,
+) -> list[str]:
+    return [
+        timeline_analysis_id(row, index)
+        for index, row in enumerate(shots)
+        if force_all or shot_requires_analysis(row, index, session)
+    ]
+
+
+def incremental_analysis_bounds(
+    shots: list[dict[str, object]],
+    target_ids: list[str],
+) -> tuple[float, float] | None:
+    wanted = set(target_ids)
+    indexes = [
+        index
+        for index, row in enumerate(shots)
+        if timeline_analysis_id(row, index) in wanted
+    ]
+    if not indexes:
+        return None
+    first = max(0, min(indexes) - 1)
+    last = min(len(shots) - 1, max(indexes) + 1)
+    start = _seconds_from_timestamp(str(shots[first].get("start", "00:00:00.000")))
+    end = _seconds_from_timestamp(str(shots[last].get("end", "00:00:00.000")))
+    return max(0.0, start), max(start + 0.1, end)
 
 
 def update_shots_with_llm_details(outputs_dir: Path, project_id: str, payload: dict[str, object]) -> dict[str, object]:
@@ -935,24 +1067,85 @@ def update_shots_with_llm_details(outputs_dir: Path, project_id: str, payload: d
     source_video = find_source_video(project_id)
     if source_video is None:
         raise FileNotFoundError("Source video not found")
-    low_threshold_candidates = detect_shot_boundaries(source_video, threshold=0.12)
+    session = load_analysis_session(project_dir)
+    source_fingerprint = source_video_fingerprint(source_video)
+    reprocess = bool(payload.get("reprocess"))
+    full_pass = (
+        reprocess
+        or not bool(session.get("hasFullAnalysis"))
+        or str(session.get("sourceVideoFingerprint") or "") != source_fingerprint
+    )
+    target_ids = analysis_target_ids(normalized, session, force_all=full_pass)
+    user_context_hash = hashlib.sha256(user_context.encode("utf-8")).hexdigest()[:16]
+    context_changed = (
+        bool(session.get("hasFullAnalysis"))
+        and str(session.get("userContextHash") or "") != user_context_hash
+    )
+    memory_only = not target_ids and context_changed and not full_pass
+    if not target_ids and not memory_only:
+        save_result = save_corrected_project(
+            outputs_dir,
+            project_id,
+            {"shots": normalized, "outline": outline, "userContext": user_context},
+        )
+        return {
+            "ok": True,
+            "upToDate": True,
+            "analysisMode": "up_to_date",
+            "shots": normalized,
+            "shotCount": len(normalized),
+            "analyzedShotCount": 0,
+            "provider": str(session.get("provider") or ""),
+            "model": str(session.get("model") or ""),
+            "suggestions": [],
+            "suggestionCount": 0,
+            "analysisSession": analysis_session_summary(project_dir, normalized),
+            **save_result,
+        }
+
+    clip_bounds = None if full_pass or memory_only else incremental_analysis_bounds(normalized, target_ids)
+    low_threshold_candidates = [] if memory_only else detect_shot_boundaries(source_video, threshold=0.12)
+    if clip_bounds is not None:
+        low_threshold_candidates = [
+            candidate
+            for candidate in low_threshold_candidates
+            if clip_bounds[0] <= candidate[0] <= clip_bounds[1]
+        ]
     current_boundaries = [
         _seconds_from_timestamp(str(row.get("end", "00:00:00.000")))
         for row in normalized[:-1]
     ]
 
     try:
-        llm_rows, llm_transitions, provider_name, provider_model = generate_shot_details_with_native_video(
-            model=model,
-            qwen_api_key=qwen_api_key,
-            gemini_api_key=gemini_api_key,
-            project_name=display_project_name(project_id),
-            project_dir=project_dir,
-            shots=normalized,
-            outline=outline,
-            user_context=user_context,
-            ffmpeg_candidates=low_threshold_candidates,
-        )
+        if memory_only:
+            llm_rows, film_memory, provider_name, provider_model = generate_analysis_from_film_memory(
+                model=model,
+                qwen_api_key=qwen_api_key,
+                gemini_api_key=gemini_api_key,
+                project_name=display_project_name(project_id),
+                project_dir=project_dir,
+                shots=normalized,
+                outline=outline,
+                user_context=user_context,
+                film_memory=session.get("filmMemory") if isinstance(session.get("filmMemory"), dict) else {},
+            )
+            llm_transitions = []
+        else:
+            llm_rows, llm_transitions, film_memory, provider_name, provider_model = generate_shot_details_with_native_video(
+                model=model,
+                qwen_api_key=qwen_api_key,
+                gemini_api_key=gemini_api_key,
+                project_name=display_project_name(project_id),
+                project_dir=project_dir,
+                shots=normalized,
+                outline=outline,
+                user_context=user_context,
+                ffmpeg_candidates=low_threshold_candidates,
+                target_analysis_ids=target_ids,
+                film_memory=session.get("filmMemory") if isinstance(session.get("filmMemory"), dict) else {},
+                full_pass=full_pass,
+                clip_bounds=clip_bounds,
+            )
     except Exception as exc:
         write_llm_error(project_dir, model, exc)
         raise
@@ -982,16 +1175,67 @@ def update_shots_with_llm_details(outputs_dir: Path, project_id: str, payload: d
         )
         suggestion["beforeFrameUrl"] = before["screenshotUrl"]
         suggestion["afterFrameUrl"] = after["screenshotUrl"]
-    save_result = save_corrected_project(outputs_dir, project_id, {"shots": merged, "outline": outline})
+    save_result = save_corrected_project(
+        outputs_dir,
+        project_id,
+        {"shots": merged, "outline": outline, "userContext": user_context},
+    )
+    generated_ids = {
+        str(row.get("analysis_id") or row.get("row_id") or "").strip()
+        for row in llm_rows
+        if isinstance(row, dict)
+    }
+    analyzed_shots = {} if full_pass else dict(session.get("analyzedShots") or {})
+    saved_at = datetime.now().isoformat(timespec="seconds")
+    for index, row in enumerate(merged):
+        analysis_id = timeline_analysis_id(row, index)
+        if analysis_id in generated_ids and not memory_only:
+            analyzed_shots[analysis_id] = {
+                "start": row.get("start", ""),
+                "end": row.get("end", ""),
+                "analyzedAt": saved_at,
+            }
+    current_ids = {timeline_analysis_id(row, index) for index, row in enumerate(merged)}
+    analyzed_shots = {
+        key: value for key, value in analyzed_shots.items() if key in current_ids
+    }
+    history = session.get("history") if isinstance(session.get("history"), list) else []
+    history = [*history[-19:], {
+        "at": saved_at,
+        "mode": "full" if full_pass else ("memory" if memory_only else "incremental"),
+        "timelineRevision": timeline_revision(merged),
+        "analyzedShotCount": len(generated_ids),
+        "provider": provider_name,
+        "model": provider_model,
+    }]
+    next_session = {
+        "version": 1,
+        "hasFullAnalysis": True,
+        "sourceVideoFingerprint": source_fingerprint,
+        "provider": provider_name,
+        "model": provider_model,
+        "firstAnalyzedAt": saved_at if full_pass or not session.get("firstAnalyzedAt") else session.get("firstAnalyzedAt"),
+        "updatedAt": saved_at,
+        "analysisRevision": safe_int(session.get("analysisRevision"), 0) + 1,
+        "timelineRevision": timeline_revision(merged),
+        "userContextHash": user_context_hash,
+        "filmMemory": film_memory,
+        "analyzedShots": analyzed_shots,
+        "history": history,
+    }
+    save_analysis_session(project_dir, next_session)
     return {
+        **save_result,
         "ok": True,
         "shots": [normalize_shot_row(row, index, project_dir) for index, row in enumerate(merged)],
         "shotCount": len(merged),
         "provider": provider_name,
         "model": provider_model,
+        "analysisMode": "full" if full_pass else ("memory" if memory_only else "incremental"),
+        "analyzedShotCount": len(generated_ids),
         "suggestions": suggestions,
         "suggestionCount": len(suggestions),
-        **save_result,
+        "analysisSession": analysis_session_summary(project_dir, merged),
     }
 
 
@@ -1308,7 +1552,7 @@ def merge_generated_shot_details(
     for index, row in enumerate(current_rows):
         next_row = dict(row)
         current_shot_number = safe_int(row.get("shot"), index + 1)
-        analysis_id = analysis_id_for_row(index)
+        analysis_id = str(row.get("analysis_id") or analysis_id_for_row(index)).strip()
         if by_analysis_id:
             generated = by_analysis_id.get(analysis_id, {})
         elif len(generated_rows) == len(current_rows):
@@ -1321,7 +1565,8 @@ def merge_generated_shot_details(
         maybe_merge_generated_field(next_row, generated, "shot_title", index, force_refresh=True)
         for field in detail_fields:
             maybe_merge_generated_field(next_row, generated, field, index, force_refresh=force_refresh)
-        next_row["analysis_stale"] = False
+        if generated:
+            next_row["analysis_stale"] = False
         merged.append(next_row)
     return merged
 
@@ -1466,6 +1711,84 @@ def is_placeholder_shot_title(value: str, index: int) -> bool:
     return normalized in placeholder_titles
 
 
+def build_memory_update_prompt(
+    project_name: str,
+    shots: list[dict[str, object]],
+    outline: dict[str, object],
+    user_context: str,
+    film_memory: dict[str, object],
+) -> str:
+    catalogue = [
+        {
+            "analysis_id": str(row.get("analysis_id") or timeline_analysis_id(row, index)),
+            "shot": index + 1,
+            "start": row.get("start", ""),
+            "end": row.get("end", ""),
+            "shot_title": row.get("shot_title", ""),
+            "visual_description": row.get("visual_description", ""),
+            "audio_dialogue": row.get("audio_dialogue", ""),
+            "action_camera": row.get("action_camera", ""),
+            "narrative_function": row.get("narrative_function", ""),
+            "notes": row.get("notes", ""),
+            "manual_fields": normalize_manual_fields(row.get("manual_fields")),
+        }
+        for index, row in enumerate(shots)
+    ]
+    return (
+        f"Film: {project_name}\n\n"
+        "This is a memory-only continuation. The video is intentionally not attached because it was already "
+        "processed in the full-film pass. Reconsider the user's hypotheses using only the durable film memory, "
+        "current shot catalogue, captions, and outline below. Do not invent new visual or audible evidence.\n\n"
+        f"Updated user study notes / hypotheses:\n{user_context or '(none provided)'}\n\n"
+        f"Durable film memory:\n{json.dumps(film_memory, ensure_ascii=False, indent=2)}\n\n"
+        f"Current shot catalogue:\n{json.dumps(catalogue, ensure_ascii=False, indent=2)}\n\n"
+        f"Current outline:\n{json.dumps(outline, ensure_ascii=False, indent=2)}\n\n"
+        "Return JSON with top-level keys shots, transitions, and film_memory. transitions must be an empty array. "
+        "Return one shots row per catalogue row with its exact analysis_id and only narrative_function and notes. "
+        "Use narrative_function to validate, refine, or reject the user's ideas against the saved evidence. "
+        "Do not replace fields named in manual_fields. Return a compact updated film_memory with synopsis, "
+        "characters, locations, motifs, narrative_progression, editing_patterns, cinematography_patterns, and "
+        "unanswered_questions."
+    )
+
+
+def generate_analysis_from_film_memory(
+    model: str,
+    qwen_api_key: str,
+    gemini_api_key: str,
+    project_name: str,
+    project_dir: Path,
+    shots: list[dict[str, object]],
+    outline: dict[str, object],
+    user_context: str,
+    film_memory: dict[str, object],
+) -> tuple[list[dict[str, object]], dict[str, object], str, str]:
+    instructions = LLM_INSTRUCTIONS_PATH.read_text(encoding="utf-8")
+    prompt = build_memory_update_prompt(project_name, shots, outline, user_context, film_memory)
+    errors: list[str] = []
+    if qwen_api_key:
+        qwen_model = normalize_qwen_model(model)
+        try:
+            raw_content = call_qwen_text(qwen_api_key, qwen_model, instructions, prompt)
+            write_llm_response(project_dir, qwen_model, raw_content, provider="qwen")
+            rows, _transitions, next_memory = parse_generated_analysis_bundle(raw_content)
+            return rows, next_memory or dict(film_memory), "qwen", qwen_model
+        except Exception as exc:
+            errors.append(f"Qwen failed: {exc}")
+            write_llm_error(project_dir, qwen_model, exc, provider="qwen")
+    if gemini_api_key:
+        gemini_model = os.environ.get("GEMINI_VIDEO_MODEL", DEFAULT_GEMINI_MODEL)
+        try:
+            raw_content = call_gemini_text(gemini_api_key, gemini_model, f"{instructions}\n\n{prompt}")
+            write_llm_response(project_dir, gemini_model, raw_content, provider="gemini")
+            rows, _transitions, next_memory = parse_generated_analysis_bundle(raw_content)
+            return rows, next_memory or dict(film_memory), "gemini", gemini_model
+        except Exception as exc:
+            errors.append(f"Gemini failed: {exc}")
+            write_llm_error(project_dir, gemini_model, exc, provider="gemini")
+    raise ValueError("Film-memory update failed. " + " | ".join(errors))
+
+
 def generate_shot_details_with_native_video(
     model: str,
     qwen_api_key: str,
@@ -1476,7 +1799,11 @@ def generate_shot_details_with_native_video(
     outline: dict[str, object],
     user_context: str,
     ffmpeg_candidates: list[tuple[float, float]],
-) -> tuple[list[dict[str, object]], list[dict[str, object]], str, str]:
+    target_analysis_ids: list[str] | None = None,
+    film_memory: dict[str, object] | None = None,
+    full_pass: bool = True,
+    clip_bounds: tuple[float, float] | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object], str, str]:
     instructions = LLM_INSTRUCTIONS_PATH.read_text(encoding="utf-8")
     prompt = build_llm_text_prompt(
         project_name,
@@ -1484,19 +1811,26 @@ def generate_shot_details_with_native_video(
         outline,
         user_context,
         ffmpeg_candidates=ffmpeg_candidates,
+        target_analysis_ids=target_analysis_ids,
+        film_memory=film_memory,
+        full_pass=full_pass,
+        clip_bounds=clip_bounds,
     )
-    video_path = prepare_analysis_video(project_dir, shots=shots)
-    if video_path is None:
-        raise FileNotFoundError("Source video not found for native video analysis")
-
     errors: list[str] = []
     if qwen_api_key:
         qwen_model = normalize_qwen_model(model)
         try:
-            raw_content = call_qwen_video(qwen_api_key, qwen_model, instructions, prompt, video_path)
+            video_paths = prepare_qwen_analysis_videos(
+                project_dir,
+                shots=shots,
+                clip_bounds=clip_bounds,
+            )
+            if not video_paths:
+                raise FileNotFoundError("Source video not found for native video analysis")
+            raw_content = call_qwen_video(qwen_api_key, qwen_model, instructions, prompt, video_paths)
             write_llm_response(project_dir, qwen_model, raw_content, provider="qwen")
-            rows, transitions = parse_generated_analysis(raw_content)
-            return rows, transitions, "qwen", qwen_model
+            rows, transitions, next_memory = parse_generated_analysis_bundle(raw_content)
+            return rows, transitions, next_memory or dict(film_memory or {}), "qwen", qwen_model
         except Exception as exc:
             errors.append(f"Qwen failed: {exc}")
             write_llm_error(project_dir, qwen_model, exc, provider="qwen")
@@ -1504,10 +1838,19 @@ def generate_shot_details_with_native_video(
     if gemini_api_key:
         gemini_model = os.environ.get("GEMINI_VIDEO_MODEL", DEFAULT_GEMINI_MODEL)
         try:
+            video_path = prepare_analysis_video(
+                project_dir,
+                max_width=640,
+                fps=8,
+                shots=shots,
+                clip_bounds=clip_bounds,
+            )
+            if video_path is None:
+                raise FileNotFoundError("Source video not found for native video analysis")
             raw_content = call_gemini_video(gemini_api_key, gemini_model, instructions, prompt, video_path)
             write_llm_response(project_dir, gemini_model, raw_content, provider="gemini")
-            rows, transitions = parse_generated_analysis(raw_content)
-            return rows, transitions, "gemini", gemini_model
+            rows, transitions, next_memory = parse_generated_analysis_bundle(raw_content)
+            return rows, transitions, next_memory or dict(film_memory or {}), "gemini", gemini_model
         except Exception as exc:
             errors.append(f"Gemini failed: {exc}")
             write_llm_error(project_dir, gemini_model, exc, provider="gemini")
@@ -1523,15 +1866,24 @@ def parse_generated_shot_rows(raw_content: str) -> list[dict[str, object]]:
 def parse_generated_analysis(
     raw_content: str,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    rows, transitions, _film_memory = parse_generated_analysis_bundle(raw_content)
+    return rows, transitions
+
+
+def parse_generated_analysis_bundle(
+    raw_content: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
     parsed = parse_llm_json(raw_content)
     rows = first_list_value(parsed, ["shots", "shot_details", "shotDetails", "rows", "items", "data"])
     if not isinstance(rows, list):
         keys = ", ".join(parsed.keys())
         raise ValueError(f"LLM response did not include a shots array. Returned keys: {keys or '(none)'}")
     transitions = first_list_value(parsed, ["transitions", "shot_boundaries", "boundaries", "cuts"])
+    memory = parsed.get("film_memory") or parsed.get("filmMemory") or {}
     return (
         [row for row in rows if isinstance(row, dict)],
         [row for row in transitions if isinstance(row, dict)] if isinstance(transitions, list) else [],
+        memory if isinstance(memory, dict) else {},
     )
 
 
@@ -1569,28 +1921,38 @@ def build_llm_text_prompt(
     outline: dict[str, object],
     user_context: str,
     ffmpeg_candidates: list[tuple[float, float]] | None = None,
+    target_analysis_ids: list[str] | None = None,
+    film_memory: dict[str, object] | None = None,
+    full_pass: bool = True,
+    clip_bounds: tuple[float, float] | None = None,
 ) -> str:
+    target_ids = set(target_analysis_ids or [
+        timeline_analysis_id(shot, index) for index, shot in enumerate(shots)
+    ])
     compact_rows = []
     for index, shot in enumerate(shots):
+        analysis_id = str(shot.get("analysis_id") or timeline_analysis_id(shot, index))
         compact_rows.append(
             {
-                "analysis_id": analysis_id_for_row(index),
+                "analysis_id": analysis_id,
                 "shot": index + 1,
                 "current_shot": index + 1,
+                "analyze_now": analysis_id in target_ids,
                 "was_combined_split_or_reordered": bool(shot.get("analysis_stale")) or is_structurally_edited_row(shot, index),
-                "title": shot.get("shot_title", "") if is_manual_field(shot, "shot_title") else "",
+                "manual_fields": normalize_manual_fields(shot.get("manual_fields")),
+                "title": shot.get("shot_title", ""),
                 "start": shot.get("start", ""),
                 "end": shot.get("end", ""),
                 "duration_seconds": shot.get("duration_seconds", 0),
-                "existing_visual_description": shot.get("visual_description", "") if is_manual_field(shot, "visual_description") else "",
+                "existing_visual_description": shot.get("visual_description", ""),
                 "existing_audio_dialogue": shot.get("audio_dialogue", ""),
-                "existing_action_camera": shot.get("action_camera", "") if is_manual_field(shot, "action_camera") else "",
-                "existing_camera_movement_type": shot.get("camera_movement_type", "") if is_manual_field(shot, "camera_movement_type") else "",
-                "existing_camera_movement_intensity": shot.get("camera_movement_intensity", "") if is_manual_field(shot, "camera_movement_intensity") else "",
-                "existing_camera_movement_confidence": shot.get("camera_movement_confidence", "") if is_manual_field(shot, "camera_movement_confidence") else "",
-                "existing_camera_movement_evidence": shot.get("camera_movement_evidence", "") if is_manual_field(shot, "camera_movement_evidence") else "",
-                "existing_narrative_function": shot.get("narrative_function", "") if is_manual_field(shot, "narrative_function") else "",
-                "existing_notes": shot.get("notes", "") if is_manual_field(shot, "notes") else "",
+                "existing_action_camera": shot.get("action_camera", ""),
+                "existing_camera_movement_type": shot.get("camera_movement_type", ""),
+                "existing_camera_movement_intensity": shot.get("camera_movement_intensity", ""),
+                "existing_camera_movement_confidence": shot.get("camera_movement_confidence", ""),
+                "existing_camera_movement_evidence": shot.get("camera_movement_evidence", ""),
+                "existing_narrative_function": shot.get("narrative_function", ""),
+                "existing_notes": shot.get("notes", ""),
             }
         )
     current_boundaries = [
@@ -1603,16 +1965,21 @@ def build_llm_text_prompt(
     ]
     return (
         f"Film: {project_name}\n\n"
+        f"Analysis mode: {'full-film first pass' if full_pass else 'incremental update of edited shots'}\n"
+        f"Attached video range in original film time: {clip_bounds if clip_bounds else 'complete film'}\n\n"
+        "Persistent film memory from the prior pass. Treat this as context, not as visual evidence for a changed shot:\n"
+        f"{json.dumps(film_memory or {}, ensure_ascii=False, indent=2)}\n\n"
         "User study notes / hypotheses:\n"
         f"{user_context or '(none provided)'}\n\n"
         "Current corrected shot list. This is the only authoritative shot sequence after the user's manual edits. "
         "Use only these rows, their analysis_id values, and these start/end timestamps for analysis. "
         "Ignore any original detector numbering that may exist elsewhere; it is not part of this request. "
-        "Return one output row for each input row, in the same order, with the exact same analysis_id and current_shot/shot number:\n"
+        "Return output rows only for rows where analyze_now is true, in their current order, with the exact same "
+        "analysis_id and current_shot/shot number. Rows where analyze_now is false are context only and must not be regenerated:\n"
         f"{json.dumps(compact_rows, ensure_ascii=False, indent=2)}\n\n"
         "Current filmic sentence / beat outline. Use it as viewer context when present:\n"
         f"{json.dumps(outline, ensure_ascii=False, indent=2)}\n\n"
-        "During this same viewing, independently check the current shot boundaries. Current boundaries in seconds:\n"
+        "During this same viewing, independently check shot boundaries visible in the attached video range. Current boundaries in seconds:\n"
         f"{json.dumps(current_boundaries)}\n\n"
         "FFmpeg low-threshold candidates are local evidence, not guaranteed cuts:\n"
         f"{json.dumps(candidate_rows, ensure_ascii=False, indent=2)}\n\n"
@@ -1627,7 +1994,8 @@ def build_llm_text_prompt(
         "shots on either side. Each object must contain the same descriptive fields as a shot row, including a "
         "1-to-7-word shot_title. This lets the app apply the cut and its details without another model request. "
         "Do not include before_details or after_details for an existing current boundary.\n\n"
-        "The full video is attached to this request. Its top-left SHOT / row label is burned into every frame from "
+        "A video is attached to this request. On the first pass it is the complete film; on later passes it is only "
+        "the changed region plus neighboring shots. Its top-left SHOT label and timestamp-derived analysis_id are burned into every frame from "
         "the user's current edited timeline. Use that visible label as the authoritative mapping for every title and "
         "description; never carry an action forward or backward into a differently labeled shot. Analyze each shot "
         "using the exact start/end timestamps above. "
@@ -1635,9 +2003,11 @@ def build_llm_text_prompt(
         "each time range and distinguish camera movement from actor, object, or edit movement.\n\n"
         "For every shot, generate shot_title as a concise card label of 1 to 7 words. "
         "Do not include the shot number in shot_title. Prefer concrete place/action/story language over generic labels.\n\n"
-        "Return exactly one JSON object with top-level keys named \"shots\" and \"transitions\". The shots value "
-        "must contain one object for every input row, using the exact field names requested. Every returned shot "
-        "must include analysis_id copied exactly from the input row."
+        "Return exactly one JSON object with top-level keys named \"shots\", \"transitions\", and \"film_memory\". "
+        "The shots value must contain one object for every analyze_now row, using the exact field names requested. "
+        "Every returned shot must include analysis_id copied exactly from the input row. film_memory must be a compact "
+        "updated object with synopsis, characters, locations, motifs, narrative_progression, editing_patterns, "
+        "cinematography_patterns, and unanswered_questions. Preserve still-valid prior memory while incorporating the new evidence."
     )
 
 
@@ -1674,7 +2044,13 @@ def ass_timestamp(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{remainder:05.2f}"
 
 
-def write_analysis_labels(path: Path, shots: list[dict[str, object]], width: int) -> None:
+def write_analysis_labels(
+    path: Path,
+    shots: list[dict[str, object]],
+    width: int,
+    offset_seconds: float = 0.0,
+    clip_end_seconds: float | None = None,
+) -> None:
     events = []
     for index, row in enumerate(shots):
         try:
@@ -1682,9 +2058,14 @@ def write_analysis_labels(path: Path, shots: list[dict[str, object]], width: int
             end = _seconds_from_timestamp(str(row.get("end", "00:00:00.000")))
         except (TypeError, ValueError):
             continue
+        if end <= offset_seconds or (clip_end_seconds is not None and start >= clip_end_seconds):
+            continue
+        label_start = max(0.0, start - offset_seconds)
+        label_end = max(label_start + 0.01, end - offset_seconds)
+        analysis_id = str(row.get("analysis_id") or timeline_analysis_id(row, index))
         events.append(
-            f"Dialogue: 0,{ass_timestamp(start)},{ass_timestamp(end)},ShotLabel,,0,0,0,,"
-            f"SHOT {index + 1:03d}  row_{index + 1:04d}"
+            f"Dialogue: 0,{ass_timestamp(label_start)},{ass_timestamp(label_end)},ShotLabel,,0,0,0,,"
+            f"SHOT {index + 1:03d}  {analysis_id}  SOURCE {start:.3f}-{end:.3f}s"
         )
     content = "\n".join(
         [
@@ -1719,6 +2100,8 @@ def prepare_analysis_video(
     max_width: int = 640,
     fps: int = 8,
     shots: list[dict[str, object]] | None = None,
+    clip_bounds: tuple[float, float] | None = None,
+    max_bytes: int | None = None,
 ) -> Path | None:
     video_path = find_source_video(project_dir.name)
     if video_path is None:
@@ -1733,20 +2116,35 @@ def prepare_analysis_video(
         }
         for row in (shots or [])
     ]
+    if clip_bounds is not None:
+        timeline_payload.append({"clip_start": clip_bounds[0], "clip_end": clip_bounds[1]})
     timeline_hash = hashlib.sha1(
         json.dumps(timeline_payload, sort_keys=True).encode("utf-8")
     ).hexdigest()[:10] if timeline_payload else "plain"
     output_path = analysis_dir / f"{project_dir.name}_analysis_{max_width}w_{fps}fps_{timeline_hash}.mp4"
-    if output_path.exists() and output_path.stat().st_mtime >= video_path.stat().st_mtime:
+    if (
+        output_path.exists()
+        and output_path.stat().st_mtime >= video_path.stat().st_mtime
+        and (not max_bytes or output_path.stat().st_size <= max_bytes)
+    ):
         return output_path
 
     ffmpeg = _require_binary("ffmpeg")
     filters = [f"scale='min({max_width},iw)':-2"]
     if shots:
         labels_path = analysis_dir / f"shot_labels_{timeline_hash}.ass"
-        write_analysis_labels(labels_path, shots, max_width)
+        write_analysis_labels(
+            labels_path,
+            shots,
+            max_width,
+            offset_seconds=clip_bounds[0] if clip_bounds else 0.0,
+            clip_end_seconds=clip_bounds[1] if clip_bounds else None,
+        )
         filters.append(f"subtitles='{ffmpeg_filter_path(labels_path)}'")
 
+    input_args = []
+    if clip_bounds is not None:
+        input_args = ["-ss", f"{clip_bounds[0]:.3f}", "-t", f"{clip_bounds[1] - clip_bounds[0]:.3f}"]
     result = _run(
         [
             ffmpeg,
@@ -1754,6 +2152,7 @@ def prepare_analysis_video(
             "-loglevel",
             "error",
             "-y",
+            *input_args,
             "-i",
             str(video_path),
             "-map",
@@ -1783,10 +2182,119 @@ def prepare_analysis_video(
     )
     if result.returncode != 0 or not output_path.exists():
         raise VideoToolError(result.stderr.strip() or "Could not prepare native video analysis copy.")
+    if max_bytes and output_path.stat().st_size > max_bytes:
+        duration = (
+            clip_bounds[1] - clip_bounds[0]
+            if clip_bounds
+            else max(
+                0.1,
+                _seconds_from_timestamp(str((shots or [{}])[-1].get("end", "00:00:00.100"))),
+            )
+        )
+        total_kbps = max(56, int((max_bytes * 8 / duration / 1000) * 0.9))
+        audio_kbps = 24
+        video_kbps = max(32, total_kbps - audio_kbps)
+        capped_path = output_path.with_name(f"{output_path.stem}_capped.mp4")
+        capped = _run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(output_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-b:v",
+                f"{video_kbps}k",
+                "-maxrate",
+                f"{video_kbps}k",
+                "-bufsize",
+                f"{video_kbps * 2}k",
+                "-c:a",
+                "aac",
+                "-b:a",
+                f"{audio_kbps}k",
+                "-ac",
+                "1",
+                "-movflags",
+                "+faststart",
+                str(capped_path),
+            ]
+        )
+        if capped.returncode != 0 or not capped_path.exists():
+            raise VideoToolError(capped.stderr.strip() or "Could not fit video inside the Qwen upload limit.")
+        capped_path.replace(output_path)
+    if max_bytes and output_path.stat().st_size > max_bytes:
+        raise VideoToolError("Prepared analysis video is still too large for Qwen Base64 input.")
     return output_path
 
 
-def call_qwen_video(api_key: str, model: str, instructions: str, prompt: str, video_path: Path) -> str:
+def prepare_qwen_analysis_videos(
+    project_dir: Path,
+    shots: list[dict[str, object]],
+    clip_bounds: tuple[float, float] | None = None,
+) -> list[Path]:
+    if clip_bounds is not None:
+        bounds = [clip_bounds]
+    else:
+        film_end = max(
+            (_seconds_from_timestamp(str(row.get("end", ""))) for row in shots),
+            default=0.0,
+        )
+        if film_end <= 0:
+            bounds = [None]
+        else:
+            bounds = []
+            segment_start = 0.0
+            while segment_start < film_end:
+                segment_end = min(film_end, segment_start + QWEN_ANALYSIS_SEGMENT_SECONDS)
+                bounds.append((segment_start, segment_end))
+                segment_start = segment_end
+
+    paths: list[Path] = []
+    for bounds_item in bounds:
+        path = prepare_analysis_video(
+            project_dir,
+            max_width=512,
+            fps=6,
+            shots=shots,
+            clip_bounds=bounds_item,
+            max_bytes=QWEN_BASE64_VIDEO_LIMIT_BYTES,
+        )
+        if path is None:
+            return []
+        paths.append(path)
+    return paths
+
+
+def call_qwen_video(
+    api_key: str,
+    model: str,
+    instructions: str,
+    prompt: str,
+    video_paths: Path | list[Path],
+) -> str:
+    is_omni = "omni" in model.casefold()
+    paths = [video_paths] if isinstance(video_paths, Path) else video_paths
+    video_parts = [
+        {"type": "video_url", "video_url": {"url": video_data_url(path)}, "fps": 2}
+        for path in paths
+    ]
+    if len(paths) > 1:
+        prompt = (
+            f"The {len(paths)} attached videos are consecutive transport segments of one film, "
+            "in chronological order. A file boundary is not a cinematic cut. Use the burned-in "
+            "SOURCE timestamps and SHOT labels as the canonical timeline.\n\n"
+            + prompt
+        )
     request_body = {
         "model": model,
         "messages": [
@@ -1794,17 +2302,46 @@ def call_qwen_video(api_key: str, model: str, instructions: str, prompt: str, vi
             {
                 "role": "user",
                 "content": [
+                    *video_parts,
                     {"type": "text", "text": prompt},
-                    {"type": "video_url", "video_url": {"url": video_data_url(video_path)}, "fps": 2},
                 ],
             },
         ],
         "temperature": 0.2,
-        "max_tokens": 24000,
         "response_format": {"type": "json_object"},
-        "enable_thinking": False,
     }
+    if is_omni:
+        request_body["stream"] = True
+        request_body["stream_options"] = {"include_usage": True}
+        request_body["modalities"] = ["text"]
+    else:
+        request_body["enable_thinking"] = False
     url = os.environ.get("QWEN_COMPATIBLE_URL", QWEN_COMPATIBLE_URL)
+    if is_omni:
+        return call_chat_completion_stream(url, api_key, request_body, "Qwen")
+    return call_chat_completion(url, api_key, request_body, "Qwen")
+
+
+def call_qwen_text(api_key: str, model: str, instructions: str, prompt: str) -> str:
+    is_omni = "omni" in model.casefold()
+    request_body: dict[str, object] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+    if is_omni:
+        request_body["stream"] = True
+        request_body["stream_options"] = {"include_usage": True}
+        request_body["modalities"] = ["text"]
+    else:
+        request_body["enable_thinking"] = False
+    url = os.environ.get("QWEN_COMPATIBLE_URL", QWEN_COMPATIBLE_URL)
+    if is_omni:
+        return call_chat_completion_stream(url, api_key, request_body, "Qwen")
     return call_chat_completion(url, api_key, request_body, "Qwen")
 
 
@@ -1823,8 +2360,8 @@ def call_gemini_video(api_key: str, model: str, instructions: str, prompt: str, 
     body = {
         "model": model,
         "input": [
-            {"type": "text", "text": text_prompt},
             video_part,
+            {"type": "text", "text": text_prompt},
         ],
     }
     request = Request(
@@ -1834,6 +2371,26 @@ def call_gemini_video(api_key: str, model: str, instructions: str, prompt: str, 
             "x-goog-api-key": api_key,
             "Content-Type": "application/json",
         },
+        method="POST",
+    )
+    try:
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(request, timeout=240) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(f"Gemini error {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise ValueError(f"Could not reach Gemini: {exc.reason}") from exc
+    return extract_text_response(payload, "Gemini")
+
+
+def call_gemini_text(api_key: str, model: str, prompt: str) -> str:
+    body = {"model": model, "input": [{"type": "text", "text": prompt}]}
+    request = Request(
+        os.environ.get("GEMINI_INTERACTIONS_URL", GEMINI_INTERACTIONS_URL),
+        data=json.dumps(body).encode("utf-8"),
+        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
         method="POST",
     )
     try:
@@ -1956,6 +2513,69 @@ def call_chat_completion(url: str, api_key: str, request_body: dict[str, object]
             f"Could not reach {provider_name} at {url}: {exc.reason}. "
             "Check your internet connection, VPN/proxy settings, and firewall permissions."
         ) from exc
+    return extract_text_response(payload, provider_name)
+
+
+def call_chat_completion_stream(
+    url: str,
+    api_key: str,
+    request_body: dict[str, object],
+    provider_name: str,
+) -> str:
+    request = Request(
+        url,
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "HTTP-Referer": "http://127.0.0.1:8765",
+            "X-Title": "Film Study Tool",
+        },
+        method="POST",
+    )
+    try:
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(request, timeout=600) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(f"{provider_name} error {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise ValueError(
+            f"Could not reach {provider_name} at {url}: {exc.reason}. "
+            "Check your internet connection, VPN/proxy settings, and firewall permissions."
+        ) from exc
+
+    chunks: list[str] = []
+    for line in raw.splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not isinstance(choices, list) or not choices:
+            continue
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+        content = delta.get("content")
+        if isinstance(content, str):
+            chunks.append(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    chunks.append(str(item["text"]))
+    if chunks:
+        return "".join(chunks)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{provider_name} returned an empty or invalid streaming response.") from exc
     return extract_text_response(payload, provider_name)
 
 

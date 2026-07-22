@@ -708,6 +708,68 @@ button:hover:not(:disabled) {
   align-content: start;
 }
 
+.analysis-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 42px;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.analysis-menu {
+  position: relative;
+}
+
+.analysis-menu > summary {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 100%;
+  min-height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #151f2d;
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 20px;
+  font-weight: 800;
+  list-style: none;
+}
+
+.analysis-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.analysis-menu[open] > summary {
+  border-color: var(--accent);
+  background: #1a2837;
+}
+
+.analysis-menu-popover {
+  position: absolute;
+  z-index: 12;
+  top: calc(100% + 7px);
+  right: 0;
+  width: 210px;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #111923;
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.38);
+}
+
+.analysis-menu-popover button {
+  width: 100%;
+  text-align: left;
+}
+
+.analysis-status {
+  min-height: 18px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .shot-grid {
   display: grid;
   gap: 18px;

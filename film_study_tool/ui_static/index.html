@@ -8,7 +8,7 @@
     <link rel="icon" href="/static/icons/wheel-favicon.png" type="image/png">
     <link rel="apple-touch-icon" href="/static/icons/wheel-192.png">
     <link rel="manifest" href="/static/manifest.webmanifest?v=20260713-wheel">
-    <link rel="stylesheet" href="/static/styles.css?v=20260722-unified-analysis">
+    <link rel="stylesheet" href="/static/styles.css?v=20260722-persistent-omni">
   </head>
   <body>
     <main class="app-shell">
@@ -103,14 +103,22 @@
             <label>
               Video analysis model
               <select id="modelField">
-                <option value="qwen3.7-plus" selected>Qwen 3.7 Plus - best default</option>
+                <option value="qwen3.5-omni-plus" selected>Qwen 3.5 Omni Plus - video + sound</option>
+                <option value="qwen3.7-plus">Qwen 3.7 Plus - visual reasoning</option>
                 <option value="qwen3-vl-plus">Qwen 3 VL Plus - dedicated vision</option>
                 <option value="qwen3-vl-flash">Qwen 3 VL Flash - faster vision</option>
-                <option value="qwen-vl-max-latest">Qwen VL Max - legacy fallback</option>
-                <option value="qwen-vl-plus-latest">Qwen VL Plus - legacy fallback</option>
               </select>
             </label>
-            <button id="generateDetails" class="primary-button" type="button">Generate Shot Details</button>
+            <div class="analysis-actions">
+              <button id="generateDetails" class="primary-button" type="button">Analyze Film</button>
+              <details class="analysis-menu">
+                <summary aria-label="Analysis options" title="Analysis options">...</summary>
+                <div class="analysis-menu-popover">
+                  <button id="reprocessVideo" type="button" disabled>Reprocess Full Video</button>
+                </div>
+              </details>
+            </div>
+            <p id="analysisStatus" class="analysis-status">Ready for first analysis.</p>
           </div>
         </section>
 
@@ -243,6 +251,6 @@
       </div>
     </section>
 
-    <script src="/static/app.js?v=20260722-unified-analysis" type="module"></script>
+    <script src="/static/app.js?v=20260722-persistent-omni" type="module"></script>
   </body>
 </html>

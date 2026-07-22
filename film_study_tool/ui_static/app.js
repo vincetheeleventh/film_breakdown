@@ -31,10 +31,12 @@ const state = {
   dirty: false,
   detailResolutionResolver: null,
   shotSuggestions: [],
+  analyzedContext: null,
 };
 
-const DEFAULT_QWEN_VIDEO_MODEL = "qwen3.7-plus";
+const DEFAULT_QWEN_VIDEO_MODEL = "qwen3.5-omni-plus";
 const QWEN_VIDEO_MODELS = new Set([
+  "qwen3.5-omni-plus",
   "qwen3.7-plus",
   "qwen3-vl-plus",
   "qwen3-vl-flash",
@@ -89,6 +91,8 @@ const els = {
   filmContextField: document.querySelector("#filmContextField"),
   modelField: document.querySelector("#modelField"),
   generateDetails: document.querySelector("#generateDetails"),
+  reprocessVideo: document.querySelector("#reprocessVideo"),
+  analysisStatus: document.querySelector("#analysisStatus"),
   detailResolution: document.querySelector("#detailResolution"),
   detailResolutionTitle: document.querySelector("#detailResolutionTitle"),
   detailResolutionSummary: document.querySelector("#detailResolutionSummary"),
@@ -513,15 +517,18 @@ function setStatus(message) {
 
 function loadLlmSettings() {
   const savedModel = localStorage.getItem("filmStudyModel");
+  const settingsVersion = localStorage.getItem("filmStudyModelSettingsVersion");
   const legacyModels = new Set(["qwen-vl-max-latest", "qwen-vl-plus-latest"]);
   els.modelField.value =
-    QWEN_VIDEO_MODELS.has(savedModel) && !legacyModels.has(savedModel)
+    settingsVersion === "omni-v1" && QWEN_VIDEO_MODELS.has(savedModel) && !legacyModels.has(savedModel)
       ? savedModel
       : DEFAULT_QWEN_VIDEO_MODEL;
+  localStorage.setItem("filmStudyModelSettingsVersion", "omni-v1");
 }
 
 function saveLlmSettings() {
   localStorage.setItem("filmStudyModel", els.modelField.value);
+  localStorage.setItem("filmStudyModelSettingsVersion", "omni-v1");
 }
 
 function contextStorageKey(projectId) {
@@ -540,6 +547,7 @@ function scheduleContextSave() {
   localStorage.setItem(contextStorageKey(state.project.id), els.filmContextField.value);
   window.clearTimeout(state.contextSaveTimer);
   state.contextSaveTimer = window.setTimeout(() => saveProjectContext(), 700);
+  renderAnalysisControls();
 }
 
 async function saveProjectContext() {
@@ -608,6 +616,9 @@ async function loadProject(projectId) {
   state.shots = data.shots;
   state.outline = normalizeOutline(data.outline);
   const loadedContext = data.userContext || "";
+  state.analyzedContext = data.analysisSession?.hasFullAnalysis && !data.analysisSession?.contextChanged
+    ? loadedContext
+    : null;
   setProjectContext(data.id, loadedContext);
   if (!loadedContext) {
     localStorage.removeItem(contextStorageKey(data.id));
@@ -629,6 +640,30 @@ async function loadProject(projectId) {
   render();
 }
 
+function renderAnalysisControls() {
+  if (!state.project) return;
+  const session = state.project.analysisSession || {};
+  const locallyChanged = state.shots.filter((shot) => shot.analysis_stale).length;
+  const changedCount = Math.max(Number(session.changedShotCount || 0), locallyChanged);
+  const hasFullAnalysis = Boolean(session.hasFullAnalysis);
+  const contextChanged = Boolean(session.contextChanged)
+    || (state.analyzedContext != null && els.filmContextField.value.trim() !== state.analyzedContext.trim());
+  els.generateDetails.textContent = hasFullAnalysis ? "Update Analysis" : "Analyze Film";
+  els.reprocessVideo.disabled = !hasFullAnalysis;
+  if (!hasFullAnalysis) {
+    els.analysisStatus.textContent = "Ready to watch the complete film and listen to its soundtrack.";
+    return;
+  }
+  const model = session.model || "saved film memory";
+  if (changedCount) {
+    els.analysisStatus.textContent = `${changedCount} changed ${changedCount === 1 ? "shot" : "shots"} ready to update with ${model}.`;
+  } else if (contextChanged) {
+    els.analysisStatus.textContent = `Updated film notes are ready to reconsider with ${model}; the video will not be resent.`;
+  } else {
+    els.analysisStatus.textContent = `Film memory is current with ${model}.`;
+  }
+}
+
 function showHome() {
   stopClip();
   pauseFullVideo();
@@ -638,6 +673,7 @@ function showHome() {
   state.project = null;
   state.shots = [];
   state.outline = { sentences: [] };
+  state.analyzedContext = null;
   setProjectContext("", "", false);
   clearSelection();
   clearUndoHistory();
@@ -662,6 +698,7 @@ function render() {
   els.editToggle.textContent = state.editMode ? "Viewing + Editing" : "Edit";
   updateUndoButton();
   if (inStudy) {
+    renderAnalysisControls();
     renderSelection();
     renderGrid();
   } else {
@@ -1938,6 +1975,10 @@ async function splitShotAt(index, cut, resolution = "blank", labelPrefix = "spli
   } else {
     blankGeneratedDetails(secondShot, "Title Pending");
   }
+  if (resolution !== "ai") {
+    firstShot.analysis_stale = true;
+    secondShot.analysis_stale = true;
+  }
   state.shots.splice(index, 1, firstShot, secondShot);
   state.shots.forEach((item, itemIndex) => {
     item.shot = itemIndex + 1;
@@ -2178,6 +2219,7 @@ async function combineRange(indices) {
   } else {
     blankGeneratedDetails(combined, "Title Pending");
   }
+  combined.analysis_stale = true;
   state.shots.splice(firstIndex, range.length, combined);
   state.shots.forEach((shot, index) => {
     shot.shot = index + 1;
@@ -2341,6 +2383,7 @@ async function saveCorrections() {
     body: JSON.stringify({ shots: state.shots, outline: state.outline, userContext: els.filmContextField.value }),
   });
   state.outline = normalizeOutline(result.outline);
+  state.project.analysisSession = result.analysisSession || state.project.analysisSession;
   state.dirty = false;
   clearUndoHistory();
   setStatus(`Saved ${result.shotCount} corrected shots. Corrected spreadsheet rebuilt.`);
@@ -2455,7 +2498,7 @@ async function applySelectedShotSuggestions() {
   }
 }
 
-async function generateShotDetails() {
+async function generateShotDetails({ reprocess = false } = {}) {
   if (!state.project || !state.shots.length) return;
   saveDetailFields();
   await saveProjectContext();
@@ -2464,8 +2507,20 @@ async function generateShotDetails() {
   }
   saveLlmSettings();
   els.generateDetails.disabled = true;
+  els.reprocessVideo.disabled = true;
   els.saveButton.disabled = true;
-  setStatus("Generating shot details and checking the timeline for missed cuts...");
+  const hasFullAnalysis = Boolean(state.project.analysisSession?.hasFullAnalysis);
+  const changedCount = Math.max(
+    Number(state.project.analysisSession?.changedShotCount || 0),
+    state.shots.filter((shot) => shot.analysis_stale).length,
+  );
+  if (reprocess || !hasFullAnalysis) {
+    setStatus("Watching the complete film, listening to its soundtrack, and building film memory...");
+  } else if (!changedCount) {
+    setStatus("Reconsidering your updated film notes from saved film memory without resending video...");
+  } else {
+    setStatus(`Updating ${changedCount} changed shot${changedCount === 1 ? "" : "s"} from saved film memory...`);
+  }
   try {
     const result = await fetchJson(`/api/projects/${encodeURIComponent(state.project.id)}/generate-details`, {
       method: "POST",
@@ -2475,10 +2530,13 @@ async function generateShotDetails() {
         userContext: els.filmContextField.value,
         shots: state.shots,
         outline: state.outline,
+        reprocess,
       }),
     });
     state.shots = result.shots;
     state.outline = normalizeOutline(result.outline);
+    state.project.analysisSession = result.analysisSession || state.project.analysisSession;
+    state.analyzedContext = els.filmContextField.value;
     state.dirty = false;
     els.saveButton.disabled = true;
     renderGrid();
@@ -2486,11 +2544,18 @@ async function generateShotDetails() {
       state.activeIndex = Math.min(state.activeIndex, state.shots.length - 1);
       syncDetailFields();
     }
-    if (result.suggestionCount) {
+    if (result.upToDate) {
+      setStatus("Analysis is already current. No video was sent again.");
+    } else if (result.suggestionCount) {
       renderShotReview(result);
       setStatus(`Generated ${result.shotCount} shot details and found ${result.suggestionCount} possible missing ${result.suggestionCount === 1 ? "cut" : "cuts"}. Review before applying.`);
     } else {
-      setStatus(`Generated details for ${result.shotCount} shots and checked the cuts with ${result.provider || "video analysis"}. Corrected spreadsheet rebuilt.`);
+      const scope = result.analysisMode === "incremental"
+        ? `${result.analyzedShotCount} changed ${result.analyzedShotCount === 1 ? "shot" : "shots"}`
+        : result.analysisMode === "memory"
+          ? "the saved film memory without resending video"
+          : "the complete film";
+      setStatus(`Analyzed ${scope} with ${result.model || result.provider || "video analysis"}. Corrected spreadsheet rebuilt.`);
     }
     await refreshProjectList();
   } catch (error) {
@@ -2499,7 +2564,19 @@ async function generateShotDetails() {
     setStatus(readErrorMessage(error, "Could not generate shot details."));
   } finally {
     els.generateDetails.disabled = false;
+    renderAnalysisControls();
   }
+}
+
+async function reprocessFullVideo() {
+  if (!state.project) return;
+  const confirmed = window.confirm(
+    "Reprocess the complete video? This starts fresh film memory and uses substantially more model input than updating changed shots.",
+  );
+  if (!confirmed) return;
+  const menu = els.reprocessVideo.closest("details");
+  if (menu) menu.open = false;
+  await generateShotDetails({ reprocess: true });
 }
 
 function readErrorMessage(error, fallback) {
@@ -2688,7 +2765,8 @@ els.clearSelection.addEventListener("click", () => {
 });
 els.undoEdit.addEventListener("click", undoLastEdit);
 els.saveButton.addEventListener("click", saveCorrections);
-els.generateDetails.addEventListener("click", generateShotDetails);
+els.generateDetails.addEventListener("click", () => generateShotDetails());
+els.reprocessVideo.addEventListener("click", reprocessFullVideo);
 els.modelField.addEventListener("change", saveLlmSettings);
 els.filmContextField.addEventListener("input", scheduleContextSave);
 els.cancelDetailResolution.addEventListener("click", () => closeDetailResolution(null));
