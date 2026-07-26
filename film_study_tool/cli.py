@@ -32,7 +32,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-minutes",
         type=float,
-        default=10.0,
+        default=30.0,
         help="Maximum video duration to process in minutes.",
     )
     parser.add_argument(

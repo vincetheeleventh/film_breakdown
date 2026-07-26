@@ -8,7 +8,7 @@
     <link rel="icon" href="/static/icons/wheel-favicon.png" type="image/png">
     <link rel="apple-touch-icon" href="/static/icons/wheel-192.png">
     <link rel="manifest" href="/static/manifest.webmanifest?v=20260713-wheel">
-    <link rel="stylesheet" href="/static/styles.css?v=20260722-persistent-omni">
+    <link rel="stylesheet" href="/static/styles.css?v=20260725-duration-units">
   </head>
   <body>
     <main class="app-shell">
@@ -52,6 +52,13 @@
           </section>
         </section>
         <div id="uploadStatus" class="upload-status" aria-live="polite"></div>
+        <header class="library-heading">
+          <div>
+            <h2>Library</h2>
+            <span id="libraryCount"></span>
+          </div>
+          <button id="createFolderButton" type="button">New Folder</button>
+        </header>
         <section id="filmGrid" class="film-grid" aria-label="Past film breakdowns"></section>
       </section>
 
@@ -59,6 +66,7 @@
         <section class="status-row" aria-live="polite">
           <div id="statusText">Preparing the shot board.</div>
           <div id="studySourcePanel" class="study-source-panel" hidden>
+            <button id="openFolderButton" class="source-link" type="button">Open Folder</button>
             <a id="sourceLink" class="source-link" href="#" target="_blank" rel="noreferrer">Open Original</a>
             <div id="socialStats" class="social-stats"></div>
           </div>
@@ -89,6 +97,16 @@
             <button id="combineSelected" type="button" disabled>Combine Selected</button>
             <button id="combineWithNext" type="button" disabled>Combine With Next</button>
             <button id="linkSentence" type="button" disabled>Link as Sentence</button>
+            <button id="removeFromSentence" type="button" disabled>Remove from Sentence</button>
+            <details class="scope-menu">
+              <summary>Analysis Scope</summary>
+              <div class="scope-menu-popover">
+                <button id="useSelectedAnalysis" type="button" disabled>Analyze Only Selected</button>
+                <button id="excludeSelected" type="button" disabled>Exclude Selected</button>
+                <button id="includeSelected" type="button" disabled>Include Selected</button>
+                <button id="includeAllShots" type="button">Include All Shots</button>
+              </div>
+            </details>
             <button id="clearSelection" type="button">Clear</button>
             <button id="undoEdit" type="button" disabled>Undo</button>
           </div>
@@ -103,7 +121,7 @@
             <label>
               Video analysis model
               <select id="modelField">
-                <option value="qwen3.5-omni-plus" selected>Qwen 3.5 Omni Plus - video + sound</option>
+                <option value="qwen3.5-omni-plus" selected>Qwen 3.5 Omni Plus - default video + sound</option>
                 <option value="qwen3.7-plus">Qwen 3.7 Plus - visual reasoning</option>
                 <option value="qwen3-vl-plus">Qwen 3 VL Plus - dedicated vision</option>
                 <option value="qwen3-vl-flash">Qwen 3 VL Flash - faster vision</option>
@@ -118,7 +136,31 @@
                 </div>
               </details>
             </div>
+            <div class="study-handoff-actions">
+              <button id="askThisFilm" type="button">Ask This Film</button>
+              <button id="exportForAi" type="button">Export for AI</button>
+            </div>
+            <p id="analysisScopeStatus" class="analysis-scope-status"></p>
             <p id="analysisStatus" class="analysis-status">Ready for first analysis.</p>
+            <div id="analysisProgress" class="analysis-progress" hidden>
+              <div class="analysis-progress-heading">
+                <span id="analysisPulse" class="analysis-pulse" aria-hidden="true"></span>
+                <strong id="analysisPhase">Preparing analysis</strong>
+                <span id="analysisElapsed">0:00</span>
+              </div>
+              <div class="analysis-progress-track" aria-hidden="true">
+                <span id="analysisProgressBar"></span>
+              </div>
+              <p id="analysisProgressDetail"></p>
+            </div>
+            <details id="analysisHistory" class="analysis-history">
+              <summary>
+                <span>Run History</span>
+                <span id="analysisHistoryCount">No runs</span>
+              </summary>
+              <div id="analysisUsage" class="analysis-usage" hidden></div>
+              <div id="analysisHistoryList" class="analysis-history-list"></div>
+            </details>
           </div>
         </section>
 
@@ -165,30 +207,18 @@
       </div>
     </section>
 
-    <section id="shotReview" class="shot-review" aria-modal="true" role="dialog" hidden>
-      <div class="shot-review-card">
-        <div class="shot-review-header">
-          <div>
-            <strong>Review Missing Cuts</strong>
-            <p id="shotReviewSummary"></p>
-          </div>
-          <button id="closeShotReview" class="icon-button" type="button" aria-label="Close cut review">X</button>
-        </div>
-        <div id="shotReviewList" class="shot-review-list"></div>
-        <div class="shot-review-actions">
-          <button id="cancelShotReview" type="button">Cancel</button>
-          <button id="applyShotSuggestions" class="primary-button" type="button">Apply Selected Cuts</button>
-        </div>
-      </div>
-    </section>
-
     <section id="detailView" class="detail-view" aria-modal="true" role="dialog" hidden>
       <div class="detail-stage">
         <button id="closeDetail" class="icon-button close-button" type="button" aria-label="Close detail view">X</button>
         <button id="prevShot" class="nav-button nav-prev" type="button" aria-label="Previous shot">&lt;</button>
         <figure class="shot-focus">
-          <img id="detailImage" alt="">
-          <video id="detailVideo" hidden playsinline controls></video>
+          <div class="shot-media">
+            <img id="detailImage" alt="">
+            <video id="detailVideo" hidden playsinline controls></video>
+            <button id="detailPlayOverlay" class="detail-play-overlay" type="button" aria-label="Play this shot" title="Play this shot">
+              <span aria-hidden="true">&#9654;</span>
+            </button>
+          </div>
           <figcaption>
             <div class="detail-meta-line">
               <span id="detailCounter"></span>
@@ -251,6 +281,33 @@
       </div>
     </section>
 
-    <script src="/static/app.js?v=20260722-persistent-omni" type="module"></script>
+    <section id="filmChat" class="film-chat" aria-label="Ask this film" hidden>
+      <div class="film-chat-backdrop"></div>
+      <aside class="film-chat-panel">
+        <header class="film-chat-header">
+          <div>
+            <strong>Ask This Film</strong>
+            <span id="filmChatModel">Continuing from saved film memory</span>
+          </div>
+          <div class="film-chat-header-actions">
+            <button id="clearFilmChat" type="button">New Conversation</button>
+            <button id="closeFilmChat" class="icon-button" type="button" aria-label="Close conversation">X</button>
+          </div>
+        </header>
+        <div id="filmChatMessages" class="film-chat-messages" aria-live="polite"></div>
+        <form id="filmChatForm" class="film-chat-form">
+          <label for="filmChatQuestion">Ask about editing, cinematography, sound, narrative, or your own interpretation.</label>
+          <textarea id="filmChatQuestion" rows="3" placeholder="What am I missing about how this sequence works?"></textarea>
+          <div>
+            <span id="filmChatStatus"></span>
+            <button id="sendFilmChat" class="primary-button" type="submit">Send</button>
+          </div>
+        </form>
+      </aside>
+    </section>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+    <script src="/static/app.js?v=20260725-remove-sentence" type="module"></script>
   </body>
 </html>

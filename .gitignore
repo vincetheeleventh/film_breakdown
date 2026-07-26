@@ -6,3 +6,8 @@ data/
 outputs/
 .env
 *.lnk
+server.stdout.log
+server.stderr.log
+
+# broken symlink from host; match as symlink too
+node_modules
