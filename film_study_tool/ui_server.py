@@ -51,6 +51,14 @@ DEFAULT_QWEN_NARRATIVE_MODEL = "qwen3.7-plus"
 DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 OUTLINE_FILENAME = "outline.json"
 OUTLINE_CSV_FILENAME = "outline.csv"
+QUESTIONS_FILENAME = "questions.json"
+QUESTIONS_CSV_FILENAME = "questions.csv"
+CHARGE_MIN = -2
+CHARGE_MAX = 2
+QUESTION_KINDS = ("curiosity", "suspense", "surprise")
+# Auto-generated legacy beat labels carry no authored content and are discarded
+# on migration. Anything else in that field was written by hand and is rescued.
+LEGACY_BEAT_NOISE_PATTERN = re.compile(r"beats?\s*\d*", re.IGNORECASE)
 STUDY_CONTEXT_FILENAME = "study_context.txt"
 LAST_LLM_RESPONSE_FILENAME = "last_llm_response.json"
 LAST_LLM_ERROR_FILENAME = "last_llm_error.json"
@@ -304,6 +312,15 @@ class ServerConfig:
     outputs_dir: Path
     static_dir: Path
     data_dir: Path
+
+
+class NarrativeDataError(ValueError):
+    """A narrative-layer file on disk is malformed in a way worth naming.
+
+    These files are meant to be read and hand-edited, so a bad edit must report
+    what is wrong and where, rather than silently yielding an empty outline or
+    ledger and looking like data loss.
+    """
 
 
 def load_dotenv(path: Path) -> None:
@@ -1615,6 +1632,106 @@ def enrich_project_with_captions(project_dir: Path, video_path: Path) -> dict[st
     return {"captionFiles": [path.name for path in copied_files], "cueCount": len(cues), "shotsUpdated": updated}
 
 
+def coerce_shot_numbers(raw: object, shot_count: int) -> list[int]:
+    """Read a shotNumbers list, dropping duplicates and out-of-range entries."""
+    if not isinstance(raw, list):
+        return []
+    numbers: list[int] = []
+    for value in raw:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= number <= shot_count and number not in numbers:
+            numbers.append(number)
+    return numbers
+
+
+def normalize_charge(raw: object, label: str) -> dict[str, object] | None:
+    """Validate a sentence's value charge.
+
+    Returns None when nothing has been entered yet, which is a legal state that
+    the minimap renders as an explicit unentered mark rather than hiding.
+    `open` and `close` must both be present or both absent -- never one.
+    """
+    if not isinstance(raw, dict):
+        return None
+    axis = str(raw.get("axis") or "").strip()
+    has_open = raw.get("open") is not None
+    has_close = raw.get("close") is not None
+    if has_open != has_close:
+        missing = "close" if has_open else "open"
+        raise NarrativeDataError(f"{label} sets only one end of its charge; {missing} is missing.")
+    if not has_open:
+        return {"axis": axis, "open": None, "close": None} if axis else None
+
+    def level(value: object, end: str) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise NarrativeDataError(
+                f"{label} has a non-numeric {end} charge ({value!r}); use a whole number from -2 to 2."
+            ) from exc
+        if not CHARGE_MIN <= number <= CHARGE_MAX:
+            raise NarrativeDataError(
+                f"{label} has {end} charge {number}, outside the -2 to 2 range."
+            )
+        return number
+
+    return {"axis": axis, "open": level(raw.get("open"), "open"), "close": level(raw.get("close"), "close")}
+
+
+def normalize_beats(raw: object, parent_shot_numbers: list[int], label: str) -> list[dict[str, object]]:
+    """Beats are the exchanges *inside* a sentence, per McKee -- the smaller unit.
+
+    Optional: a sentence may own its shots directly with no beats at all. When
+    beats are present their shots must be a subset of the parent sentence's,
+    because the sentence's shotNumbers stays the single source of truth for
+    duration, position, and every existing consumer.
+    """
+    if not isinstance(raw, list):
+        return []
+    allowed = set(parent_shot_numbers)
+    beats: list[dict[str, object]] = []
+    claimed: set[int] = set()
+    for index, row in enumerate(raw):
+        if not isinstance(row, dict):
+            continue
+        numbers = [
+            number
+            for number in coerce_shot_numbers(row.get("shotNumbers", row.get("shots", [])), max(allowed, default=0))
+            if number in allowed and number not in claimed
+        ]
+        if not numbers:
+            continue
+        claimed.update(numbers)
+        beats.append(
+            {
+                "id": str(row.get("id") or f"{label}-beat-{index + 1}"),
+                "title": str(row.get("title") or "").strip(),
+                "shotNumbers": sorted(numbers),
+            }
+        )
+    beats.sort(key=lambda beat: beat["shotNumbers"][0])
+    return beats
+
+
+def migrate_legacy_beat_label(row: dict[str, object], idea: str) -> str:
+    """The legacy `beat` string meant the opposite of the current `beats` array.
+
+    It described a grouping *larger* than a sentence. In practice it held either
+    auto-generated noise ("Beat 1", "Beat 2") or, where a human wrote in it, a
+    real description. Drop the noise; rescue the description into `idea` when
+    `idea` is empty so no authored text is lost.
+    """
+    legacy = str(row.get("beat") or "").strip()
+    if not legacy or LEGACY_BEAT_NOISE_PATTERN.fullmatch(legacy):
+        return idea
+    if idea:
+        return idea
+    return legacy
+
+
 def normalize_outline(outline: object, shot_count: int) -> dict[str, object]:
     source = outline.get("sentences", []) if isinstance(outline, dict) else outline
     if not isinstance(source, list):
@@ -1623,26 +1740,20 @@ def normalize_outline(outline: object, shot_count: int) -> dict[str, object]:
     for index, row in enumerate(source):
         if not isinstance(row, dict):
             continue
-        raw_numbers = row.get("shotNumbers", row.get("shots", []))
-        if not isinstance(raw_numbers, list):
-            raw_numbers = []
-        shot_numbers = []
-        for value in raw_numbers:
-            try:
-                number = int(value)
-            except (TypeError, ValueError):
-                continue
-            if 1 <= number <= shot_count and number not in shot_numbers:
-                shot_numbers.append(number)
+        shot_numbers = coerce_shot_numbers(row.get("shotNumbers", row.get("shots", [])), shot_count)
         if not shot_numbers:
             continue
+        sentence_id = str(row.get("id") or f"sentence-{index + 1}")
+        label = f"Sentence {index + 1}"
+        idea = migrate_legacy_beat_label(row, str(row.get("idea") or "").strip())
         sentences.append(
             {
-                "id": str(row.get("id") or f"sentence-{index + 1}"),
-                "beat": str(row.get("beat") or "Beat 1").strip() or "Beat 1",
-                "title": str(row.get("title") or f"Sentence {index + 1}").strip() or f"Sentence {index + 1}",
-                "idea": str(row.get("idea") or "").strip(),
+                "id": sentence_id,
+                "title": str(row.get("title") or label).strip() or label,
+                "idea": idea,
                 "shotNumbers": shot_numbers,
+                "beats": normalize_beats(row.get("beats"), shot_numbers, sentence_id),
+                "charge": normalize_charge(row.get("charge"), label),
             }
         )
     return {"sentences": sentences}
@@ -1653,9 +1764,14 @@ def load_outline(project_dir: Path, shot_count: int) -> dict[str, object]:
     if not outline_path.exists():
         return {"sentences": []}
     try:
-        return normalize_outline(load_json(outline_path), shot_count)
-    except (OSError, json.JSONDecodeError, ValueError):
-        return {"sentences": []}
+        raw = load_json(outline_path)
+    except json.JSONDecodeError as exc:
+        raise NarrativeDataError(
+            f"{OUTLINE_FILENAME} is not valid JSON (line {exc.lineno}, column {exc.colno}): {exc.msg}"
+        ) from exc
+    except OSError as exc:
+        raise NarrativeDataError(f"{OUTLINE_FILENAME} could not be read: {exc}") from exc
+    return normalize_outline(raw, shot_count)
 
 
 def save_outline(project_dir: Path, outline: object, shot_count: int) -> dict[str, object]:
@@ -1665,20 +1781,226 @@ def save_outline(project_dir: Path, outline: object, shot_count: int) -> dict[st
 
     outline_csv = project_dir / OUTLINE_CSV_FILENAME
     with outline_csv.open("w", newline="", encoding="utf-8") as handle:
-        fieldnames = ["sentence", "beat", "title", "shots", "idea"]
+        fieldnames = ["sentence", "title", "shots", "beats", "axis", "open", "close", "turns", "idea"]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for index, sentence in enumerate(normalized["sentences"], start=1):
+            charge = sentence.get("charge") or {}
+            opening = charge.get("open")
+            closing = charge.get("close")
             writer.writerow(
                 {
                     "sentence": index,
-                    "beat": sentence["beat"],
                     "title": sentence["title"],
                     "shots": ", ".join(str(number) for number in sentence["shotNumbers"]),
+                    "beats": len(sentence.get("beats") or []),
+                    "axis": charge.get("axis", ""),
+                    "open": "" if opening is None else opening,
+                    "close": "" if closing is None else closing,
+                    "turns": "" if opening is None or closing is None else ("no" if opening == closing else "yes"),
                     "idea": sentence["idea"],
                 }
             )
     return normalized
+
+
+def shot_bounds(shots: list[dict[str, object]]) -> list[tuple[float, float]]:
+    """Start/end seconds per shot, in shot order."""
+    bounds: list[tuple[float, float]] = []
+    for row in shots:
+        start = _seconds_from_timestamp(str(row.get("start", "00:00:00.000")))
+        end = _seconds_from_timestamp(str(row.get("end", "00:00:00.000")))
+        bounds.append((start, end))
+    return bounds
+
+
+def film_runtime(shots: list[dict[str, object]]) -> float:
+    """Total runtime in seconds.
+
+    Nothing on disk records this, so it is always derived from the end of the
+    last shot. Every time-axis calculation in the narrative layer depends on it.
+    """
+    bounds = shot_bounds(shots)
+    return max((end for _start, end in bounds), default=0.0)
+
+
+def sentence_span(sentence: dict[str, object], shots: list[dict[str, object]]) -> tuple[float, float]:
+    """Wall-clock span of a sentence, from its first shot's start to its last shot's end.
+
+    A hand-edited sentence may hold non-contiguous shots (shots 4, 9, 17). The
+    span still runs first->last so the time axis stays honest; the renderer
+    marks such a sentence as interrupted rather than pretending it is solid.
+    """
+    numbers = [number for number in sentence.get("shotNumbers") or [] if 1 <= number <= len(shots)]
+    if not numbers:
+        return (0.0, 0.0)
+    bounds = shot_bounds(shots)
+    return (bounds[min(numbers) - 1][0], bounds[max(numbers) - 1][1])
+
+
+def sentence_is_contiguous(sentence: dict[str, object]) -> bool:
+    numbers = sorted(sentence.get("shotNumbers") or [])
+    return bool(numbers) and numbers == list(range(numbers[0], numbers[-1] + 1))
+
+
+def sentence_duration(sentence: dict[str, object], shots: list[dict[str, object]]) -> float:
+    """Sum of member shot durations -- not the span, which may include foreign shots."""
+    total = 0.0
+    for number in sentence.get("shotNumbers") or []:
+        if 1 <= number <= len(shots):
+            total += float(shots[number - 1].get("duration_seconds") or 0.0)
+    return round(total, 3)
+
+
+def scene_id_at(seconds: float, sentences: list[dict[str, object]], shots: list[dict[str, object]]) -> str:
+    """Which sentence contains this timestamp.
+
+    Always recomputed, never trusted from storage: boundary correction moves
+    sentences underneath timestamps that were stamped before the correction.
+    """
+    for sentence in sentences:
+        start, end = sentence_span(sentence, shots)
+        if start <= seconds < end:
+            return str(sentence.get("id") or "")
+    return ""
+
+
+def normalize_question(raw: object, index: int, strict: bool = True) -> dict[str, object] | None:
+    """Validate one question-ledger entry.
+
+    The terminal question mark is a deliberate constraint, not a nicety: it
+    forces an articulation of what the audience is made to wonder rather than
+    what the scene is about. There is no bypass.
+    """
+    if not isinstance(raw, dict):
+        return None
+    text = str(raw.get("text") or "").strip()
+    if not text:
+        return None
+    if not text.endswith("?"):
+        if strict:
+            raise NarrativeDataError(
+                "Write it as a question - what is the audience made to wonder? "
+                f"(question {index + 1}: {text[:60]!r})"
+            )
+        return None
+    kind = str(raw.get("kind") or "").strip().lower()
+    if kind not in QUESTION_KINDS:
+        if strict:
+            raise NarrativeDataError(
+                f"Question {index + 1} has kind {kind or '(empty)'!r}; "
+                f"expected one of {', '.join(QUESTION_KINDS)}."
+            )
+        kind = "suspense"
+    try:
+        opened_at = float(raw.get("opened_at"))
+    except (TypeError, ValueError) as exc:
+        raise NarrativeDataError(f"Question {index + 1} has no readable opened_at timestamp.") from exc
+    closed_raw = raw.get("closed_at")
+    closed_at: float | None
+    if closed_raw is None or closed_raw == "":
+        # Null is a legal, meaningful state: the film never answers it.
+        closed_at = None
+    else:
+        try:
+            closed_at = float(closed_raw)
+        except (TypeError, ValueError) as exc:
+            raise NarrativeDataError(f"Question {index + 1} has an unreadable closed_at timestamp.") from exc
+        if closed_at < opened_at:
+            raise NarrativeDataError(
+                f"Question {index + 1} closes at {closed_at:.2f}s, before it opens at {opened_at:.2f}s."
+            )
+    return {
+        "id": str(raw.get("id") or f"q{index + 1}"),
+        "text": text,
+        "kind": kind,
+        "opened_at": round(max(0.0, opened_at), 3),
+        "closed_at": None if closed_at is None else round(closed_at, 3),
+    }
+
+
+def normalize_questions(
+    raw: object,
+    sentences: list[dict[str, object]] | None = None,
+    shots: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    source = raw.get("questions", []) if isinstance(raw, dict) else raw
+    if not isinstance(source, list):
+        source = []
+    questions: list[dict[str, object]] = []
+    for index, row in enumerate(source):
+        question = normalize_question(row, index)
+        if question is None:
+            continue
+        # *_scene fields are derived on every load, never trusted from disk.
+        if sentences is not None and shots is not None:
+            question["opened_scene"] = scene_id_at(question["opened_at"], sentences, shots)
+            question["closed_scene"] = (
+                "" if question["closed_at"] is None else scene_id_at(question["closed_at"], sentences, shots)
+            )
+        questions.append(question)
+    questions.sort(key=lambda row: row["opened_at"])
+    return {"questions": questions}
+
+
+def load_questions(
+    project_dir: Path,
+    sentences: list[dict[str, object]] | None = None,
+    shots: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    questions_path = project_dir / QUESTIONS_FILENAME
+    if not questions_path.exists():
+        return {"questions": []}
+    try:
+        raw = load_json(questions_path)
+    except json.JSONDecodeError as exc:
+        raise NarrativeDataError(
+            f"{QUESTIONS_FILENAME} is not valid JSON (line {exc.lineno}, column {exc.colno}): {exc.msg}"
+        ) from exc
+    except OSError as exc:
+        raise NarrativeDataError(f"{QUESTIONS_FILENAME} could not be read: {exc}") from exc
+    return normalize_questions(raw, sentences, shots)
+
+
+def save_questions(
+    project_dir: Path,
+    payload: object,
+    sentences: list[dict[str, object]] | None = None,
+    shots: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    normalized = normalize_questions(payload, sentences, shots)
+    (project_dir / QUESTIONS_FILENAME).write_text(json.dumps(normalized, indent=2), encoding="utf-8")
+
+    runtime = film_runtime(shots or [])
+    questions_csv = project_dir / QUESTIONS_CSV_FILENAME
+    with questions_csv.open("w", newline="", encoding="utf-8") as handle:
+        fieldnames = ["id", "text", "kind", "opened_at", "closed_at", "hold_seconds", "resolved"]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for question in normalized["questions"]:
+            closed_at = question["closed_at"]
+            hold = (runtime if closed_at is None else closed_at) - question["opened_at"]
+            writer.writerow(
+                {
+                    "id": question["id"],
+                    "text": question["text"],
+                    "kind": question["kind"],
+                    "opened_at": question["opened_at"],
+                    "closed_at": "" if closed_at is None else closed_at,
+                    "hold_seconds": round(max(0.0, hold), 3),
+                    "resolved": "no" if closed_at is None else "yes",
+                }
+            )
+    return normalized
+
+
+def open_question_count_at(seconds: float, questions: list[dict[str, object]]) -> int:
+    return sum(
+        1
+        for question in questions
+        if question["opened_at"] <= seconds
+        and (question["closed_at"] is None or question["closed_at"] > seconds)
+    )
 
 
 def normalize_ai_generated_outline(
@@ -1710,28 +2032,38 @@ def normalize_ai_generated_outline(
                 runs[-1].append(number)
         for run_index, run in enumerate(runs):
             used.update(run)
+            sentence_id = str(row.get("id") or f"sentence-{len(repaired) + 1}") + (
+                f"-{run_index + 1}" if run_index else ""
+            )
+            run_members = set(run)
             repaired.append(
                 {
-                    "id": str(row.get("id") or f"sentence-{len(repaired) + 1}")
-                    + (f"-{run_index + 1}" if run_index else ""),
-                    "beat": str(row.get("beat") or "Beat 1"),
+                    "id": sentence_id,
                     "title": str(row.get("title") or f"Sentence {len(repaired) + 1}"),
                     "idea": str(row.get("idea") or ""),
                     "shotNumbers": run,
+                    # Carry only the beats whose shots survived into this run.
+                    "beats": [
+                        beat
+                        for beat in (row.get("beats") or [])
+                        if run_members.issuperset(beat.get("shotNumbers") or [])
+                        and beat.get("shotNumbers")
+                    ],
+                    "charge": row.get("charge"),
                 }
             )
 
     for shot_number in sorted(allowed):
         if shot_number in used:
             continue
-        prior_beat = repaired[-1]["beat"] if repaired else "Beat 1"
         repaired.append(
             {
                 "id": f"sentence-auto-{shot_number}",
-                "beat": prior_beat,
                 "title": f"Shot {shot_number}",
                 "idea": "",
                 "shotNumbers": [shot_number],
+                "beats": [],
+                "charge": None,
             }
         )
     repaired.sort(key=lambda row: row["shotNumbers"][0])
